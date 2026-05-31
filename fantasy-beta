@@ -1,0 +1,3657 @@
+--[[
+		Fantasy.fix
+		Beta version
+		ds: seedww
+]]
+
+-- ================================================================
+-- WHITELIST — solo IDs autorizados pueden usar el script
+-- Para agregar alguien: pedile que corra print(cheat.GetUserID())
+-- en la consola de Aimware y te mande el número.
+-- ================================================================
+-- ================================================================
+-- USUARIOS — agregá cada persona con su UID, nombre y número
+-- Para obtener la UID: print(cheat.GetUserID()) en consola Aimware
+-- ================================================================
+local _users = {
+    [486936] = { name = "agany",     uid = "1" },
+    [558363] = { name = "lucie",     uid = "2" },
+	[61632] =  { name = "blurry",    uid = "3" },
+}
+
+local _uid = cheat.GetUserID()
+if not _users[_uid] then
+    print("[fantasy] access denied.")
+    print("[fantasy] to request access, run: print(cheat.GetUserID())")
+    return
+end
+print("[fantasy] access granted")
+local _cur_user = _users[_uid] or { name = "unknown", uid = tostring(_uid) }
+print("[fantasy] welcome, " .. _cur_user.name)
+-- ================================================================
+
+-- ================================================================
+-- CLANTAG CONFIG
+-- ================================================================
+local CT_TAGS      = { "炎ヽ(•́_•́)ノ炎", "火ノ(•̀_•̀)ヽ火", "✵乁(•́_•̀)ㄏ✵" }
+local CT_NAME_SEP  = "."      -- separador entre tag y nombre
+local CT_ANIM_STEP = 0.3      -- segundos entre frames (menor = mas rapido)
+local CT_PAUSE     = 6        -- repeticiones por tag
+-- ================================================================
+
+local _sv_last_tick = {}
+local _sv_last_val  = {}
+local _sv_throttle  = 8
+local function sv(path, val)
+    -- Verificar que el path existe ANTES de escribir.
+    -- gui.SetValue en un path inválido puede causar crash a nivel C++ que
+    -- el pcall de Lua no atrapa.
+    local ok_get, cur = pcall(function() return gui.GetValue(path) end)
+    if not ok_get or cur == nil then return end
+
+    local t = globals.TickCount()
+    if _sv_last_val[path] ~= val then
+        _sv_last_tick[path] = t
+        _sv_last_val[path]  = val
+        pcall(function() gui.SetValue(path, val) end)
+        return
+    end
+    if _sv_last_tick[path] and (t - _sv_last_tick[path]) < _sv_throttle then return end
+    _sv_last_tick[path] = t
+    pcall(function() gui.SetValue(path, val) end)
+end
+
+local _bm_cb_names = {}
+
+if _G.__fantasy_v2_loaded then
+    pcall(function() callbacks.Unregister("CreateMove",    "fv2_createmove") end)
+    pcall(function() callbacks.Unregister("CreateMove",    "fv2_kb_cm")      end)
+    pcall(function() callbacks.Unregister("PreMove",       "fv2_aa_premove") end)  -- FIX #7
+    pcall(function() callbacks.Unregister("FireGameEvent", "fv2_fge")        end)
+    pcall(function() callbacks.Unregister("Draw",          "fv2_draw")       end)
+    pcall(function() callbacks.Unregister("Draw",          "fv2_ind_reset")  end)
+    pcall(function() callbacks.Unregister("Draw",          "fv2_tabswitch")  end)
+    pcall(function() callbacks.Unregister("Draw",          "fv2_kb_draw")    end)
+    pcall(function() callbacks.Unregister("Draw",          "fv2_rb_draw")    end)
+    pcall(function() callbacks.Unregister("Draw",          "fv2_rb_wepsel")  end)
+    pcall(function() callbacks.Unregister("Draw",          "fv2_kb_wepsel")  end)
+    pcall(function() callbacks.Unregister("Draw",          "fv2_aa_draw")    end)
+    pcall(function() callbacks.Unregister("Draw",          "fv2_aa_ext_vis") end)
+    pcall(function() callbacks.Unregister("Draw",          "fv2_aa_no_upd")  end)
+    _G._fv2_aa_ext = nil
+    _G._fv2_aa_dc  = nil
+    _G.__fantasy_v2_loaded = nil
+end
+
+-- ================================================================
+-- INDICATOR SYSTEM
+-- ================================================================
+local _ind_fonts         = {}
+local _ind_fonts_skeet   = {}
+local _xhair_sel         = 0   -- 0=Side (Verdana), 1=Crosshair (Verdana 12 w2000)
+local _xhair_size_val    = 12  -- tamaño actual (actualizado desde GUI)
+
+-- Cache de fuente crosshair por size: se recrea solo cuando el size cambia
+local _xhair_font_cache  = {}   -- [size] = font
+local function _get_xhair_font(size)
+    if not _xhair_font_cache[size] then
+        pcall(function()
+            _xhair_font_cache[size] = draw.CreateFont("Verdana", size, 2000)
+        end)
+    end
+    return _xhair_font_cache[size]
+end
+local _ind_background  = nil
+local _ind_frame_slots = {}
+local _ind_off_x_val        = 0
+local _ind_off_y_val        = 0   -- Side
+local _ind_off_y_xhair_val  = 0   -- Crosshair
+local _ind_dpi         = 1   -- cacheado por frame en fv2_ind_reset
+
+pcall(function()
+    _ind_background = draw.CreateTexture(common.RasterizeSVG[[
+        <svg width="100" height="100" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+            <linearGradient id="g" x1="50%" y1="0%" x2="0%" y2="0%">
+                <stop offset="0%"   style="stop-color:rgb(0,0,0);stop-opacity:0.65"/>
+                <stop offset="100%" style="stop-color:rgb(0,0,0);stop-opacity:0"/>
+            </linearGradient>
+        </defs>
+        <rect width="100" height="100" fill="url(#g)"/>
+        </svg>
+    ]])
+end)
+
+local _ind_font_sizes = { [1]=20, [1.25]=24, [1.5]=28, [1.75]=32, [2]=36 }
+
+-- Pre-crear las 5 fuentes al cargar el script (fuera de Draw)
+-- Evita crash por draw.CreateFont bajo carga dentro de un callback
+do
+    local _dpi_values = {1, 1.25, 1.5, 1.75, 2}
+    for _, dpi in ipairs(_dpi_values) do
+        local size = _ind_font_sizes[dpi] or 20
+        pcall(function()
+            _ind_fonts[dpi]       = { draw.CreateFont("Verdana", size, 600),  size }
+            _ind_fonts_skeet[dpi] = { draw.CreateFont("Verdana", 12,   2000), 12   }
+        end)
+    end
+end
+
+-- Fuente "Skeet": Verdana 12 weight 2000 — igual que isabel
+local _xhair_skeet_font = nil
+pcall(function()
+    _xhair_skeet_font = draw.CreateFont("Verdana", 12, 2000)
+    _xhair_font_cache[12] = _xhair_skeet_font   -- pre-calentar el cache
+end)
+
+-- Pre-crear fuentes del rango del slider ind_xhair_gap (9-15)
+-- Evita que _get_xhair_font llame draw.CreateFont dentro de Draw bajo carga (crash con TM/Trigger activo)
+do
+    for _sz = 9, 15 do
+        if not _xhair_font_cache[_sz] then
+            pcall(function()
+                _xhair_font_cache[_sz] = draw.CreateFont("Verdana", _sz, 2000)
+            end)
+        end
+    end
+end
+
+local function _ind_get_font(dpi)
+    if _xhair_sel == 1 then
+        return _ind_fonts_skeet[dpi] or { _xhair_skeet_font, 12 }
+    end
+    -- FIX #10: draw.CreateFont en Draw bajo carga puede crashear.
+    -- Las fuentes se pre-crean al cargar el script (bloque do..end).
+    -- Si por alguna razón no existe, usar la fuente más cercana en lugar de crear una nueva.
+    if not _ind_fonts[dpi] then
+        local closest_dpi, closest_dist = 1, 999
+        for d, _ in pairs(_ind_fonts) do
+            local dist = math.abs(d - dpi)
+            if dist < closest_dist then closest_dpi = d; closest_dist = dist end
+        end
+        return _ind_fonts[closest_dpi] or { _xhair_skeet_font, 12 }
+    end
+    return _ind_fonts[dpi]
+end
+
+
+local _ind_skeet_pending = {}   -- buffer para modo Skeet (dibuja centrado al final)
+
+local function renderer_indicator(r, g, b, a, ...)
+    local text = table.concat({...})
+
+    -- Modo Skeet: acumular para dibujar centrado en crosshair al final
+    if _xhair_sel == 1 then
+        table.insert(_ind_skeet_pending, { r=r, g=g, b=b, a=a, text=text })
+        table.insert(_ind_frame_slots, true)
+        return
+    end
+
+    local dpi  = _ind_dpi   -- cacheado en fv2_ind_reset, no releer gui cada call
+
+    local fi   = _ind_get_font(dpi)
+    local font, fs = fi[1], fi[2]
+    if not font then return end
+    draw.SetFont(font)
+
+    local tw, th = draw.GetTextSize(text)
+    local _, sh  = draw.GetScreenSize()
+
+    local index  = #_ind_frame_slots
+    local offset = (fs + math.floor(12 * dpi)) * index
+    
+    local x = math.floor(fs) + _ind_off_x_val
+    local y = math.floor(sh - 350 * dpi) - offset + _ind_off_y_val
+
+    if _ind_background then
+        draw.SetTexture(_ind_background)
+        draw.Color(0, 0, 0, 40)
+        draw.FilledRect(
+            math.floor(x + tw * 0.5 - tw * 0.8), y,
+            math.floor(x + tw * 0.5),             y + fs + math.floor(4 * dpi))
+        draw.FilledRect(
+            math.floor(x + tw * 0.5 + tw * 0.8), y,
+            math.floor(x + tw * 0.5),             y + fs + math.floor(4 * dpi))
+        draw.SetTexture(nil)
+    else
+        draw.Color(0, 0, 0, 100)
+        draw.FilledRect(x - 4, y - 2, x + tw + 4, y + fs + 2)
+    end
+
+    local text_y = math.floor(y + math.floor(2 * dpi) + (fs - th) * 0.5)
+    local drawn  = false
+    pcall(function()
+        draw.Color(r, g, b, a)
+        draw.TextShadow(x, text_y, text)
+        drawn = true
+    end)
+    if not drawn then
+        pcall(function()
+            draw.Color(0, 0, 0, math.min(255, math.floor(a * 0.65)))
+            draw.Text(x + 1, text_y + 1, text)
+            draw.Color(r, g, b, a)
+            draw.Text(x, text_y, text)
+        end)
+    end
+
+    table.insert(_ind_frame_slots, true)
+end
+
+-- _ind_frame_slots se resetea al inicio de fv2_draw (ver abajo)
+-- OPT: tabla valid fija (no recrear cada frame) + throttle cada 30 frames
+local _ind_reset_valid = {1, 1.25, 1.5, 1.75, 2}
+local _ind_reset_frame = 0
+callbacks.Register("Draw", "fv2_ind_reset", function()
+    _ind_reset_frame = _ind_reset_frame + 1
+    if _ind_reset_frame < 30 then return end
+    _ind_reset_frame = 0
+    pcall(function()
+        local raw = gui.GetValue("adv.dpi")
+        if not raw then return end
+        local dpi = (raw + 3) * 0.25
+        local closest = 1
+        for _, v in ipairs(_ind_reset_valid) do
+            if math.abs(v - dpi) < math.abs(closest - dpi) then closest = v end
+        end
+        if closest ~= _ind_dpi then _ind_dpi = closest end
+    end)
+end)
+
+-- ================================================================
+-- INIT
+-- ================================================================
+local _init_done     = false
+local _hidevm_was_on = false
+local _init_cb_name = "fv2_init_" .. tostring(math.random(1, 99999))
+
+-- Defaults delay randomizer (file scope)
+local _def_fov_min = { 2.0,  2.0,  2.0,  1.5,  1.5,  2.5,  3.0,  2.0,  4.0,  1.5 }
+local _def_fov_max = { 5.0,  6.0,  5.0,  4.0,  4.5,  7.0,  8.0,  5.5,  9.0,  4.0 }
+local _def_smo_min = { 3,    4,    3,    2,    3,    4,    5,    3,    5,    2    }
+local _def_smo_max = { 7,    9,    8,    6,    7,   10,   11,    8,   12,    6    }
+local _def_dly_min = { 40,   20,   30,    8,   10,   25,   40,   20,   55,    8   }
+local _def_dly_max = { 90,   50,   70,   22,   25,   65,   90,   50,  110,   18   }
+local _def_bst_min = { 8,    8,    8,    6,    7,    9,   10,    8,   12,    6   }
+local _def_bst_max = { 18,   20,   18,   14,   16,   22,   24,   18,   28,   14   }
+local _def_sd      = {}
+
+-- Peek style: declarados en file scope para no agregar locals al init callback
+local peek_style, peek_style_col
+
+-- ================================================================
+-- FILE-SCOPE STATE: movido del init callback para evitar >200 locals (límite Lua)
+-- ================================================================
+local kb_wep_groups = {
+    "zeus", "pistol", "hpistol", "smg",
+    "rifle", "shotgun", "scout", "asniper", "sniper", "lmg"
+}
+local _last_shot_ms       = 0
+local kb_forcebody_was_on = false
+local kb_forcebody_orig   = {}
+local _aa_ind_shared  = { sym_d = "▼", is_back = false }
+local _fv2_fs_active  = false
+local _rb_wepsel_last = {}
+local rb_fov_state    = { current = 0, next_tick = 0 }
+local _last_rb_autowall = nil
+local _rb_fb_orig       = nil
+local _rb_fb_orig_grp   = nil
+local _last_rage_state  = nil
+local _last_legit_state = nil
+local _wm_active = false
+local _wm_text   = ""
+local _wm_style  = 0       -- 0=Glass, 1=Edge
+local _wm_pos    = 0
+local _wm_bg     = {10, 10, 10, 115}
+local _wm_accent = {200, 200, 200, 255}
+local _wm_font   = nil
+local as_orig_hc        = nil
+local qs_switch_back_at = nil
+local qs_return_slot    = 1
+local _qs_pending_slot3 = false
+local _fg_pending_cmd    = nil
+local _fg_switch_back_at = nil
+local _fg_prev_slot    = 1  -- slot previo al throw (1=primaria, 2=pistola)
+local AS_FLAGS    = { ONGROUND = bit.lshift(1, 0) }
+local AS_MOVETYPE = { NOCLIP = 8, LADDER = 9 }
+local AS_BUTTONS  = { IN_SPEED = bit.lshift(1, 16) }
+local fg_switch_at       = nil
+local fg_next_cmd        = nil
+local _pk_peeking   = false
+local _pk_start_pos = nil
+local _pk_returning = false
+local _pk_has_target = false
+local _last_tab = -1
+local _ct_last      = ""
+local _ct_frame_idx = 1
+local _ct_frames    = {}
+-- ================================================================
+
+callbacks.Register("Draw", _init_cb_name, function()
+    if _init_done then return end
+    _init_done = true
+    callbacks.Unregister("Draw", _init_cb_name)
+
+    local init_sw, init_sh = draw.GetScreenSize()
+
+    local WIN_W  = 395
+    local WIN_H  = 465 --tamanio
+    local BORDER = 8
+    local TAB_H  = 32
+
+    local win = gui.Window("fv2_wnd", "fantasy.fix",
+        math.floor(init_sw / 3),
+        math.floor(init_sh / 3),
+        WIN_W, WIN_H)
+
+    local CW      = math.floor((WIN_W - 3 * BORDER) / 2)
+    local CY      = TAB_H + 2 * BORDER + 26
+    local RIGHT_X = BORDER * 2 + CW + 6
+    local CW_R    = WIN_W - RIGHT_X - BORDER
+
+    local ctrl_box = gui.Groupbox(win, "Fantasy", BORDER, BORDER, CW, TAB_H + BORDER)
+    local tab_sel  = gui.Combobox(ctrl_box, "fv2_tab", "category", "Visual", "Misc", "Legit", "Rage", "AA")
+
+    local tab_groups = { [0]={}, [1]={}, [2]={}, [3]={}, [4]={} }
+    local function reg_group(idx, grp) table.insert(tab_groups[idx], grp) end
+    local function refresh_tabs()
+        local t = tab_sel:GetValue()
+        for idx, groups in pairs(tab_groups) do
+            for _, g in ipairs(groups) do g:SetInvisible(idx ~= t) end
+        end
+    end
+    local function bind_master(master_cb, children)
+        local _bm_last = nil  -- OPT: dirty-check, evita SetInvisible cada frame
+        local function upd()
+            local v = master_cb:GetValue()
+            if v == _bm_last then return end
+            _bm_last = v
+            for _, c in ipairs(children) do pcall(function() c:SetInvisible(not v) end) end
+        end
+        local cb_name = "fv2_bm_" .. tostring(master_cb)
+        callbacks.Register("Draw", cb_name, function() upd() end)
+        _bm_cb_names[#_bm_cb_names + 1] = cb_name
+        upd()
+    end
+
+    -- ================================================================
+    -- TAB 2: LEGIT
+    -- ================================================================
+    -- Columna izquierda : Delay Randomizer  (ocupa toda la columna desde CY)
+    -- Columna derecha   : Keybinds Legitbot (top) + Shot Control (bottom)
+
+    -- 6 checkboxes × ~22px + header ~20px + padding ~10px = 184px
+    local KB_H = 204
+    local SC_Y = BORDER + KB_H + BORDER
+
+    -- Keybinds Legitbot: columna DERECHA, solo los 5 keybinds
+    local legit_left = gui.Groupbox(win, "Keybind Legitbot", RIGHT_X, BORDER, CW_R, KB_H)
+    reg_group(2, legit_left)
+
+    local kb_trigger_aimbot = gui.Checkbox(legit_left, "fv2.kb.trigger.aim", "Aimbot",        false)
+    local kb_trigger        = gui.Checkbox(legit_left, "fv2.kb.trigger",     "Trigger",       false)
+    local kb_autofire       = gui.Checkbox(legit_left, "fv2.kb.autofire",    "Autofire",      false)
+    local kb_autowall       = gui.Checkbox(legit_left, "fv2.kb.autowall",    "Autowall",      false)
+    local kb_thrusmoke      = gui.Checkbox(legit_left, "fv2.kb.thrusmoke",   "Through Smoke", false)
+    local kb_forcebody      = gui.Checkbox(legit_left, "fv2.kb.forcebody",   "Body Aim",      false)
+
+    -- Shot Control: groupbox separado, empieza con gap de 8px tras Body Aim
+    local shot_ctrl = gui.Groupbox(win, "Fire Control", RIGHT_X, SC_Y, CW_R, WIN_H - SC_Y - BORDER)
+    reg_group(2, shot_ctrl)
+
+    local kb_stopshot_cb  = gui.Checkbox(shot_ctrl, "fv2.kb.stopshot",  "Stop Shot",    false)
+    local kb_stiming_cb   = gui.Checkbox(shot_ctrl, "fv2.kb.stiming",   "Shot Lock",    false)
+    local kb_inacc_val    = gui.Slider  (shot_ctrl, "fv2.kb.inacc",     "  Inaccuracy", 0.03, 0.0, 0.15, 0.01)
+    kb_inacc_val:SetInvisible(true)
+    bind_master(kb_stiming_cb, { kb_inacc_val })
+
+    -- Shot Delay: solo armas que se benefician del delay
+    -- Zeus/Scout/Sniper/LMG removidos (one-shot o bolt-action)
+    local _sd_groups   = { "pistol", "hpistol", "smg", "rifle", "shotgun", "asniper" }
+    local _sd_defaults = { 120,      180,        50,    70,      150,       100       }
+
+    local kb_shotdelay_cb = gui.Checkbox(shot_ctrl, "fv2.kb.shotdelay", "Shot Delay", false)
+    local kb_sd_ms = {}
+    for i = 1, #_sd_groups do
+        kb_sd_ms[i] = gui.Slider(shot_ctrl, "fv2.kb.sd."..i..".ms", "  Delay ms", _sd_defaults[i], 10, 300, 5)
+        kb_sd_ms[i]:SetInvisible(true)
+    end
+
+    local kb_shot_wep = gui.Combobox(shot_ctrl, "fv2.kb.shot.weapon", "  Weapon",
+        "Pistol", "Heavy Pistol", "Sub Machine",
+        "Rifle", "Shotgun", "Auto Sniper")
+    kb_shot_wep:SetInvisible(true)
+    bind_master(kb_shotdelay_cb, { kb_shot_wep })
+
+    local function kb_stopshot()   return kb_stopshot_cb:GetValue()  end
+    local function kb_shottiming() return kb_stiming_cb:GetValue()   end
+    local function kb_shotdelay()  return kb_shotdelay_cb:GetValue() end
+
+    -- Delay Randomizer: columna IZQUIERDA (ocupa toda la columna)  ← SWAPPED
+    local ess_right = gui.Groupbox(win, "Random Offset", BORDER, CY, CW, WIN_H - CY - BORDER)
+    reg_group(2, ess_right)
+
+    local kb_ess_master = gui.Checkbox(ess_right, "fv2.kb.ess", "Offset Range", false)
+
+    -- Modos activos: multibox para activar uno o varios
+    local kb_mode_multi  = gui.Multibox(ess_right, "  Mode")
+    local kb_mode_fov    = gui.Checkbox(kb_mode_multi, "fv2.kb.mode.fov",   "FOV",           false)
+    local kb_mode_sm     = gui.Checkbox(kb_mode_multi, "fv2.kb.mode.sm",    "Smooth",        false)
+    local kb_mode_delay    = gui.Checkbox(kb_mode_multi, "fv2.kb.mode.delay", "TDelay", false)
+    local kb_mode_burst    = gui.Checkbox(kb_mode_multi, "fv2.kb.mode.burst", "TBurst", false)
+    kb_mode_multi:SetInvisible(true)
+    bind_master(kb_ess_master, { kb_mode_multi })
+
+    local kb_wep_combo = gui.Combobox(ess_right, "fv2.kb.weapon", "  Weapon",
+        "Zeus", "Pistol", "Heavy Pistol", "Sub Machine",
+        "Rifle", "Shotgun", "Scout", "Auto Sniper", "Sniper", "Light Machine")
+    kb_wep_combo:SetInvisible(true)
+
+    -- Defaults por arma: zeus, pistol, hpistol, smg, rifle, shotgun, scout, asniper, sniper, lmg
+
+    -- FOV sliders (sin checkbox propio)
+    local kb_fmin, kb_fmax = {}, {}
+    for i = 1, #kb_wep_groups do
+        kb_fmin[i] = gui.Slider(ess_right, "fv2.kb.wep"..i..".minf", "    Min FOV", _def_fov_min[i] or 4.0, 0.5, 30.0, 0.1)
+        kb_fmax[i] = gui.Slider(ess_right, "fv2.kb.wep"..i..".maxf", "    Max FOV", _def_fov_max[i] or 12.0, 0.5, 30.0, 0.1)
+        kb_fmin[i]:SetInvisible(true)
+        kb_fmax[i]:SetInvisible(true)
+    end
+
+    -- Smooth sliders
+    local kb_smin, kb_smax = {}, {}
+    for i = 1, #kb_wep_groups do
+        kb_smin[i] = gui.Slider(ess_right, "fv2.kb.wep"..i..".mins", "    Min Smooth", _def_smo_min[i] or 5,  1, 30, 0.1)
+        kb_smax[i] = gui.Slider(ess_right, "fv2.kb.wep"..i..".maxs", "    Max Smooth", _def_smo_max[i] or 12, 1, 30, 0.1)
+        kb_smin[i]:SetInvisible(true)
+        kb_smax[i]:SetInvisible(true)
+    end
+
+    -- Trigger Delay sliders
+    local kb_dmin, kb_dmax = {}, {}
+    for i = 1, #kb_wep_groups do
+        kb_dmin[i] = gui.Slider(ess_right, "fv2.kb.wep"..i..".mind", "    Min Delay", _def_dly_min[i] or 20, 0, 500, 1)
+        kb_dmax[i] = gui.Slider(ess_right, "fv2.kb.wep"..i..".maxd", "    Max Delay", _def_dly_max[i] or 30, 0, 500, 1)
+        kb_dmin[i]:SetInvisible(true)
+        kb_dmax[i]:SetInvisible(true)
+    end
+
+    -- Trigger Burst sliders
+    local kb_bmin, kb_bmax = {}, {}
+    for i = 1, #kb_wep_groups do
+        kb_bmin[i] = gui.Slider(ess_right, "fv2.kb.wep"..i..".minb", "    Min Burst", _def_bst_min[i] or 8,  0, 60, 1)
+        kb_bmax[i] = gui.Slider(ess_right, "fv2.kb.wep"..i..".maxb", "    Max Burst", _def_bst_max[i] or 18, 0, 60, 1)
+        kb_bmin[i]:SetInvisible(true)
+        kb_bmax[i]:SetInvisible(true)
+    end
+
+
+    local function kb_fovadj()    return kb_ess_master:GetValue() and kb_mode_fov  :GetValue() end
+    local function kb_smoothadj() return kb_ess_master:GetValue() and kb_mode_sm   :GetValue() end
+    local function kb_trdelay()   return kb_ess_master:GetValue() and kb_mode_delay:GetValue() end
+    local function kb_trburst()   return kb_ess_master:GetValue() and kb_mode_burst:GetValue() end
+
+    -- Estados con next_tick
+    local kb_fov_state = {}
+    for _, grp in ipairs(kb_wep_groups) do
+        kb_fov_state[grp] = { current = 1.0, next_tick = 0 }
+    end
+
+    local kb_osc_state = {}
+    for _, grp in ipairs(kb_wep_groups) do
+        kb_osc_state[grp] = { current = 5, target = 5, next_tick = 0 }
+    end
+
+    local kb_delay_state, kb_burst_state = {}, {}
+    for _, grp in ipairs(kb_wep_groups) do
+        kb_delay_state[grp] = { current = 0,  next_tick = 0 }
+        kb_burst_state[grp] = { current = 20, next_tick = 0 }
+    end
+
+
+    -- GUI por arma
+    local kb_wep_gui = {}
+    for i = 1, #kb_wep_groups do
+        kb_wep_gui[i] = {
+            min_fov    = kb_fmin[i],   max_fov    = kb_fmax[i],
+            min_smooth = kb_smin[i],   max_smooth = kb_smax[i],
+            min_delay  = kb_dmin[i],   max_delay  = kb_dmax[i],
+            min_burst  = kb_bmin[i],   max_burst  = kb_bmax[i],
+        }
+    end
+
+    -- Weapon selector visibility: muestra sliders del modo activo para el arma seleccionada
+    local _kb_wepsel_last = {}   -- dirty-check: solo actualiza cuando algo cambia
+    callbacks.Register("Draw", "fv2_kb_wepsel", function()
+        pcall(function()
+            local ess_on   = kb_ess_master:GetValue()
+            local sel      = kb_wep_combo:GetValue() + 1
+            local show_fov = ess_on and kb_mode_fov  :GetValue()
+            local show_sm  = ess_on and kb_mode_sm   :GetValue()
+            local show_td  = ess_on and kb_mode_delay:GetValue()
+            local show_tb  = ess_on and kb_mode_burst:GetValue()
+
+            local lc = _kb_wepsel_last
+            if lc.ess == ess_on and lc.sel == sel and lc.fov == show_fov
+               and lc.sm == show_sm and lc.td == show_td and lc.tb == show_tb then
+                return  -- nada cambió: ahorra ~80 SetInvisible por frame
+            end
+            lc.ess=ess_on; lc.sel=sel; lc.fov=show_fov
+            lc.sm=show_sm; lc.td=show_td; lc.tb=show_tb
+
+            kb_wep_combo:SetInvisible(not ess_on)
+
+            for i = 1, #kb_wep_groups do
+                local s = (i == sel)
+                kb_fmin[i]:SetInvisible(not (s and show_fov))
+                kb_fmax[i]:SetInvisible(not (s and show_fov))
+                kb_smin[i]:SetInvisible(not (s and show_sm))
+                kb_smax[i]:SetInvisible(not (s and show_sm))
+                kb_dmin[i]:SetInvisible(not (s and show_td))
+                kb_dmax[i]:SetInvisible(not (s and show_td))
+                kb_bmin[i]:SetInvisible(not (s and show_tb))
+                kb_bmax[i]:SetInvisible(not (s and show_tb))
+            end
+            -- Clamp min <= max
+            if show_fov and sel >= 1 and sel <= #kb_wep_groups then
+                if kb_wep_gui[sel].min_fov:GetValue() > kb_wep_gui[sel].max_fov:GetValue() then
+                    kb_wep_gui[sel].max_fov:SetValue(kb_wep_gui[sel].min_fov:GetValue()) end end
+            if show_sm  and sel >= 1 and sel <= #kb_wep_groups then
+                if kb_wep_gui[sel].min_smooth:GetValue() > kb_wep_gui[sel].max_smooth:GetValue() then
+                    kb_wep_gui[sel].max_smooth:SetValue(kb_wep_gui[sel].min_smooth:GetValue()) end end
+            if show_td  and sel >= 1 and sel <= #kb_wep_groups then
+                if kb_wep_gui[sel].min_delay:GetValue() > kb_wep_gui[sel].max_delay:GetValue() then
+                    kb_wep_gui[sel].max_delay:SetValue(kb_wep_gui[sel].min_delay:GetValue()) end end
+            if show_tb  and sel >= 1 and sel <= #kb_wep_groups then
+                if kb_wep_gui[sel].min_burst:GetValue() > kb_wep_gui[sel].max_burst:GetValue() then
+                    kb_wep_gui[sel].max_burst:SetValue(kb_wep_gui[sel].min_burst:GetValue()) end end
+        end)
+    end)
+
+    -- Visibilidad sliders inacc en Keybinds Legitbot (independiente de Delay Randomizer)
+    callbacks.Register("Draw", "fv2_st_wepsel", function()
+        pcall(function()
+            local sd_on = kb_shotdelay_cb:GetValue()
+            local sel   = kb_shot_wep:GetValue() + 1
+            for i = 1, #_sd_groups do
+                kb_sd_ms[i]:SetInvisible(not (sd_on and i == sel))
+            end
+        end)
+    end)
+
+    -- ----------------------------------------------------------------
+    -- Draw callback principal del Legit
+    -- ----------------------------------------------------------------
+    local _prev = {
+        aimbot    = false,
+        trigger   = false,
+        autofire  = false,
+        autowall  = false,
+        thrusmoke = false,
+    }
+
+    callbacks.Register("Draw", "fv2_kb_draw", function()
+        pcall(function()
+
+            local aimbot   = kb_trigger_aimbot:GetValue()
+            local trigger  = kb_trigger:GetValue()
+            local autofire = kb_autofire:GetValue()
+            local autowall = kb_autowall:GetValue()
+
+            -- ── Aimbot ──────────────────────────────────────────────
+            if aimbot ~= _prev.aimbot then
+                _prev.aimbot = aimbot
+                if aimbot then
+                    pcall(function() gui.SetValue("lbot.master",      true)  end)
+                    pcall(function() gui.SetValue("lbot.enable",      true)  end)
+                    pcall(function() gui.SetValue("lbot.enabled",     true)  end)
+                    pcall(function() gui.SetValue("lbot.aim.enable",  true)  end)
+                    pcall(function() gui.SetValue("lbot.aim.autofire",false)  end)
+                else
+                    pcall(function() gui.SetValue("lbot.aim.enable",  false) end)
+                    pcall(function() gui.SetValue("lbot.aim.autofire",false)  end)
+                    -- apagar master solo si trigger y autofire también están off
+                    if not trigger and not autofire then
+                        pcall(function() gui.SetValue("lbot.master",  false) end)
+                        pcall(function() gui.SetValue("lbot.enable",  false) end)
+                        pcall(function() gui.SetValue("lbot.enabled", false) end)
+                    end
+                end
+            end
+
+            -- ── Trigger ─────────────────────────────────────────────
+            if trigger ~= _prev.trigger then
+                _prev.trigger = trigger
+                if trigger then
+                    pcall(function() gui.SetValue("lbot.master",       true)  end)
+                    pcall(function() gui.SetValue("lbot.enable",       true)  end)
+                    pcall(function() gui.SetValue("lbot.enabled",      true)  end)
+                    pcall(function() gui.SetValue("lbot.trg.enable",   true)  end)
+                else
+                    pcall(function() gui.SetValue("lbot.trg.enable",   false) end)
+                    if not autofire then
+                        pcall(function() gui.SetValue("lbot.trg.autofire", false) end)
+                    end
+                    if not aimbot and not autofire then
+                        pcall(function() gui.SetValue("lbot.master",  false) end)
+                        pcall(function() gui.SetValue("lbot.enable",  false) end)
+                        pcall(function() gui.SetValue("lbot.enabled", false) end)
+                    end
+                end
+            end
+
+            -- ── Autofire ─────────────────────────────────────────────
+            if autofire ~= _prev.autofire then
+                _prev.autofire = autofire
+                if autofire then
+                    pcall(function() gui.SetValue("lbot.master",          true)  end)
+                    pcall(function() gui.SetValue("lbot.enable",          true)  end)
+                    pcall(function() gui.SetValue("lbot.enabled",         true)  end)
+                    pcall(function() gui.SetValue("lbot.trg.enable",      true)  end)
+                    pcall(function() gui.SetValue("lbot.trg.autofire",    true)  end)
+                else
+                    pcall(function() gui.SetValue("lbot.trg.autofire",    false) end)
+                    if not trigger then
+                        pcall(function() gui.SetValue("lbot.trg.enable",  false) end)
+                    end
+                    if not aimbot and not trigger then
+                        pcall(function() gui.SetValue("lbot.master",  false) end)
+                        pcall(function() gui.SetValue("lbot.enable",  false) end)
+                        pcall(function() gui.SetValue("lbot.enabled", false) end)
+                    end
+                end
+            end
+
+            -- Siempre: si trigger o aimbot ON pero autofire OFF → forzar autofire false
+            -- Usar sv() en vez de gui.SetValue directo para validar path y throttlear
+            if (trigger or aimbot) and not autofire then
+                sv("lbot.trg.autofire", false)
+                sv("lbot.aim.autofire", false)
+            end
+
+            -- ── Autowall ─────────────────────────────────────────────
+            if autowall ~= _prev.autowall then
+                _prev.autowall = autowall
+                for _, grp in ipairs(kb_wep_groups) do
+                    sv("lbot.weapon.vis."..grp..".autowall", autowall)
+                end
+            end
+
+            -- ── Through Smoke ─────────────────────────────────────────
+            local thrusmoke = kb_thrusmoke:GetValue()
+            if thrusmoke ~= _prev.thrusmoke then
+                _prev.thrusmoke = thrusmoke
+                for _, grp in ipairs(kb_wep_groups) do
+                    sv("lbot.weapon.vis."..grp..".smoke", thrusmoke)
+                end
+            end
+
+            -- ── Body Aim ─────────────────────────────────────────────
+            -- FIX: hitbox se aplica UNA SOLA VEZ al activarse (no cada frame)
+            -- Llamar gui.SetValue 20x/frame con autofire activo causaba crash
+            if kb_forcebody:GetValue() then
+                if not kb_forcebody_was_on then
+                    -- 1. Guardar originales
+                    for _, grp in ipairs(kb_wep_groups) do
+                        pcall(function()
+                            kb_forcebody_orig[grp] = {
+                                aim = gui.GetValue("lbot.aim.hitbox."..grp..".hitbox"),
+                                trg = gui.GetValue("lbot.trg.hitbox."..grp..".hitbox"),
+                            }
+                        end)
+                    end
+                    -- 2. Aplicar body aim solo aqui (flanco de subida)
+                    for _, grp in ipairs(kb_wep_groups) do
+                        pcall(function() gui.SetValue("lbot.aim.hitbox."..grp..".hitbox", "2 2 0 2 2 0 0 0") end)
+                        pcall(function() gui.SetValue("lbot.trg.hitbox."..grp..".hitbox", "2 2 0 2 2 0 0 0") end)
+                    end
+                    kb_forcebody_was_on = true
+                end
+                -- Sin repeticion cada frame → no mas crash con autofire
+            else
+                if kb_forcebody_was_on then
+                    for _, grp in ipairs(kb_wep_groups) do
+                        pcall(function()
+                            local orig = kb_forcebody_orig[grp]
+                            if not orig then return end
+                            if orig.aim ~= nil then
+                                pcall(function() gui.SetValue("lbot.aim.hitbox."..grp..".hitbox", orig.aim) end)
+                            end
+                            if orig.trg ~= nil then
+                                pcall(function() gui.SetValue("lbot.trg.hitbox."..grp..".hitbox", orig.trg) end)
+                            end
+                        end)
+                    end
+                    kb_forcebody_orig   = {}
+                    kb_forcebody_was_on = false
+                end
+            end
+
+
+            -- --------------------------------------------------------
+            -- Delay Randomizer
+            -- OPT: early-return antes del bloque pesado si está apagado
+            -- --------------------------------------------------------
+            if kb_ess_master:GetValue() then
+                local _tick = globals.TickCount()   -- cachear 1 vez para todos los loops
+                if kb_fovadj() then
+                    local legit_active = kb_trigger:GetValue() or kb_autofire:GetValue()
+                    local tick_lo = legit_active and 22 or 40
+                    local tick_hi = legit_active and 50 or 90
+                    for i, grp in ipairs(kb_wep_groups) do
+                        pcall(function()
+                            local g_mn = kb_wep_gui[i].min_fov:GetValue()
+                            local g_mx = kb_wep_gui[i].max_fov:GetValue()
+                            if g_mn > g_mx then g_mn, g_mx = g_mx, g_mn end
+                            local st = kb_fov_state[grp]
+                            if _tick >= st.next_tick then
+                                local steps  = math.max(0, math.floor((g_mx - g_mn) / 0.1 + 0.5))
+                                st.current   = math.floor((g_mn + math.random(0, steps) * 0.1) * 10 + 0.5) / 10
+                                st.current   = math.max(g_mn, math.min(g_mx, st.current))
+                                st.next_tick = _tick + math.random(tick_lo, tick_hi)
+                            end
+                            sv("lbot.weapon.target."..grp..".maxfov", st.current)
+                            sv("lbot.weapon.vis."..grp..".maxfov",    st.current)
+                        end)
+                    end
+                end
+
+                if kb_trdelay() then
+                    for i, grp in ipairs(kb_wep_groups) do
+                        pcall(function()
+                            local st = kb_delay_state[grp]
+                            local mn = kb_wep_gui[i].min_delay:GetValue()
+                            local mx = kb_wep_gui[i].max_delay:GetValue()
+                            if mn > mx then mn, mx = mx, mn end
+                            if _tick >= st.next_tick then
+                                -- FIX: 8-25 ticks era demasiado rápido (~0.12-0.39s).
+                                -- Ahora 50-110 ticks (~0.78-1.72s) → cambios más humanos.
+                                st.current   = math.random(math.floor(mn), math.floor(mx))
+                                st.next_tick = _tick + math.random(50, 110)
+                            end
+                            local p = "lbot.trg.weapon."..grp..".delay"
+                            if gui.GetValue(p) ~= nil then gui.SetValue(p, st.current) end
+                        end)
+                    end
+                end
+
+                if kb_trburst() then
+                    for i, grp in ipairs(kb_wep_groups) do
+                        pcall(function()
+                            local st = kb_burst_state[grp]
+                            local mn = kb_wep_gui[i].min_burst:GetValue()
+                            local mx = kb_wep_gui[i].max_burst:GetValue()
+                            if mn > mx then mn, mx = mx, mn end
+                            if _tick >= st.next_tick then
+                                -- FIX: igual que TDelay — 50-110 ticks para variación humana
+                                st.current   = math.random(math.floor(mn), math.floor(mx))
+                                st.next_tick = _tick + math.random(50, 110)
+                            end
+                            local p = "lbot.trg.weapon."..grp..".burst"
+                            if gui.GetValue(p) ~= nil then gui.SetValue(p, st.current) end
+                        end)
+                    end
+                end
+
+            end -- end del bloque principal de delay randomizer
+
+        end)
+    end)
+
+    -- ----------------------------------------------------------------
+    -- CreateMove: Smooth oscillation
+    -- ----------------------------------------------------------------
+    callbacks.Register("CreateMove", "fv2_kb_cm", function(cmd)
+        if kb_ess_master:GetValue() and kb_smoothadj() then
+            pcall(function()
+                for i, grp in ipairs(kb_wep_groups) do
+                    local st = kb_osc_state[grp]
+                    local mn = kb_wep_gui[i].min_smooth:GetValue()
+                    local mx = kb_wep_gui[i].max_smooth:GetValue()
+                    if mn > mx then mn, mx = mx, mn end
+                    -- Actualizar target cada N ticks; el valor real hace lerp gradual
+                    if globals.TickCount() >= (st.next_tick or 0) then
+                        local steps = math.max(0, math.floor((mx - mn) / 0.1 + 0.5))
+                        st.target    = math.floor((mn + math.random(0, steps) * 0.1) * 10 + 0.5) / 10
+                        st.target    = math.max(mn, math.min(mx, st.target))
+                        -- FIX: 12-28 ticks era muy rápido. 30-65 ticks (~0.47-1.02s) más natural.
+                        st.next_tick = globals.TickCount() + math.random(30, 65)
+                    end
+                    -- FIX: lerp 0.10 convergía muy rápido (robótico). 0.05 = transición más suave.
+                    local tgt = st.target or st.current
+                    st.current = st.current + (tgt - st.current) * 0.05
+                    st.current = math.max(mn, math.min(mx, st.current))
+                    local p = "lbot.weapon.aim."..grp..".smooth"
+                    if gui.GetValue(p) ~= nil then gui.SetValue(p, st.current) end
+                end
+            end)
+        end
+
+        -- ----------------------------------------------------------------
+        -- Fire Control: Stop Shot / Shot Lock / Shot Delay
+        -- Un solo SetButtons al final del tick para evitar conflictos y crashes
+        -- ----------------------------------------------------------------
+        local _fc_any = kb_stopshot() or kb_shottiming() or kb_shotdelay()
+        if _fc_any then
+            pcall(function()
+                if not cmd then return end
+                local IN_ATTACK  = 1
+                local btns = cmd:GetButtons()
+                if type(btns) ~= "number" then return end
+                local attacking = bit.band(btns, IN_ATTACK) ~= 0
+
+                -- Stop Shot: detener movimiento al disparar
+                if kb_stopshot() and attacking then
+                    cmd:SetForwardMove(0)
+                    cmd:SetSideMove(0)
+                end
+
+                local suppress = false
+
+                -- Shot Lock: suprimir si inaccuracy > threshold
+                if kb_shottiming() and attacking then
+                    local ok, inacc = pcall(function()
+                        local lp = entities.GetLocalPawn()
+                        if not lp or not lp:IsAlive() then return 0 end
+                        local wep_handle = nil
+                        pcall(function()
+                            local h = lp:GetPropEntity("m_hActiveWeapon")
+                            if h and type(h) == "userdata" then
+                                local ok2, valid = pcall(function() return h:IsValid() end)
+                                if ok2 and valid then wep_handle = h end
+                            end
+                        end)
+                        if not wep_handle then return 0 end
+                        local v = 0
+                        pcall(function()
+                            local r = wep_handle:GetPropFloat("m_flInaccuracy")
+                            if type(r) == "number" and r == r then v = r end  -- NaN guard
+                        end)
+                        if v == 0 then
+                            pcall(function()
+                                local r = wep_handle:GetPropFloat("m_fAccuracyPenalty")
+                                if type(r) == "number" and r == r then v = r end
+                            end)
+                        end
+                        return v
+                    end)
+                    local inacc_val = (ok and type(inacc) == "number") and inacc or 0
+                    if inacc_val > kb_inacc_val:GetValue() then
+                        suppress = true
+                    end
+                end
+
+                -- Shot Delay: suprimir durante N ms
+                -- FIX: resetear _last_shot_ms cuando no se está disparando.
+                -- Sin esto, soltar y volver a presionar fire dentro del cooldown
+                -- suprimía el primer disparo de la nueva ráfaga (bug de timing).
+                if kb_shotdelay() then
+                    if not attacking then
+                        _last_shot_ms = 0
+                    elseif not suppress then
+                        local now_ms = globals.RealTime() * 1000
+                        local sd_sel = math.max(1, math.min(#kb_sd_ms, kb_shot_wep:GetValue() + 1))
+                        local delay  = (kb_sd_ms[sd_sel] and kb_sd_ms[sd_sel]:GetValue()) or 80
+                        if (now_ms - _last_shot_ms) < delay then
+                            suppress = true
+                        else
+                            _last_shot_ms = now_ms
+                        end
+                    end
+                end
+
+                -- Aplicar supresión una sola vez
+                if suppress then
+                    local new_btns = bit.band(btns, bit.bnot(IN_ATTACK))
+                    if type(new_btns) == "number" then
+                        cmd:SetButtons(new_btns)
+                    end
+                end
+            end)
+        end
+    end)
+
+    -- ================================================================
+    -- TAB 3: RAGE
+    -- ================================================================
+    -- Columna izquierda : Min Dmg        ← SWAPPED
+    -- Columna derecha   : Keybind Ragebot ← SWAPPED
+
+    local rb_wep_groups = {"shared","zeus","pistol","hpistol","smg","rifle","shotgun","scout","asniper","sniper","lmg"}
+
+    -- Keybind Ragebot: columna DERECHA, altura ajustada al contenido (hasta Range)
+    local KB_R_H  = 305
+    local rb_misc = gui.Groupbox(win, "Keybind Ragebot", RIGHT_X, BORDER, CW_R, KB_R_H)
+    reg_group(3, rb_misc)
+
+    local rb_rage_enable     = gui.Checkbox(rb_misc, "fv2.rb.rage.en",     "Rage",        false)
+    local rb_autowall_enable = gui.Checkbox(rb_misc, "fv2.rb.autowall.en", "Autowall",    false)
+    local rb_forcebody       = gui.Checkbox(rb_misc, "fv2.rb.forcebody",   "Force Body",  false)
+    local rb_nospread        = gui.Checkbox(rb_misc, "fv2.rb.nospread",    "Nospread",    false)
+    local rb_doubletap       = gui.Checkbox(rb_misc, "fv2.rb.doubletap",   "Doubletap",   false)
+    local rb_antirecoil      = gui.Checkbox(rb_misc, "fv2.rb.antirecoil",  "Anti-Recoil", false)
+
+    local rb_dynfov_enable = gui.Checkbox(rb_misc, "fv2.rb.dynfov.en",  "Dynamic FOV",  false)
+    local rb_dynfov_min    = gui.Slider  (rb_misc, "fv2.rb.dynfov.min", "  Min FOV",    5.0,  1.0, 60.0, 1)
+    local rb_dynfov_max    = gui.Slider  (rb_misc, "fv2.rb.dynfov.max", "  Max FOV",    18.0, 1.0, 90.0, 1)
+    local rb_dynfov_factor = gui.Slider  (rb_misc, "fv2.rb.dynfov.fac", "  Range",        100,  10,  300,  1)
+
+    rb_dynfov_min   :SetInvisible(true)
+    rb_dynfov_max   :SetInvisible(true)
+    rb_dynfov_factor:SetInvisible(true)
+    bind_master(rb_dynfov_enable, { rb_dynfov_min, rb_dynfov_max, rb_dynfov_factor })
+
+    -- Anti-Aim: columna IZQUIERDA del tab AA (tab 4)
+    local rb_aa_box = gui.Groupbox(win, "Anti-Aim", RIGHT_X, BORDER, CW_R, WIN_H - 2*BORDER)
+    reg_group(4, rb_aa_box)
+
+    local test4_en    = gui.Checkbox(rb_aa_box, "fv2.rb.aa.test4.en",  "Angle",  false)
+    local test4_cat   = gui.Combobox(rb_aa_box, "fv2.rb.aa.test4.cat", "  Group", "AA Legit", "AA Rage")
+    test4_cat:SetInvisible(true)
+    bind_master(test4_en, { test4_cat })
+
+    -- Disable para AA Legit (aparece debajo de Group, sobre AA Left)
+    local _leg_dc_multi   = gui.Multibox(rb_aa_box, "Disable")
+    local _leg_dc_onkey   = gui.Checkbox(_leg_dc_multi, "fv2.legit.aa.dc.onkey",   "On Key", false)
+    local _leg_dc_onknife = gui.Checkbox(_leg_dc_multi, "fv2.legit.aa.dc.onknife", "Knife",  false)
+    local _leg_dc_ongren  = gui.Checkbox(_leg_dc_multi, "fv2.legit.aa.dc.ongren",  "Nade",   false)
+    local _leg_dc_keybox  = gui.Keybox  (rb_aa_box,    "fv2.legit.aa.dc.key",      "  Disable Key", 0)
+    _leg_dc_multi :SetInvisible(true)
+    _leg_dc_keybox:SetInvisible(true)
+    _G._fv2_legit_dc = { multi = _leg_dc_multi, onkey = _leg_dc_onkey,
+                          onknife = _leg_dc_onknife, ongren = _leg_dc_ongren,
+                          keybox = _leg_dc_keybox }
+
+    -- ── Angle Override (Test3): en rb_aa_box, guardado en _G para no sumar locals ──
+    do
+        local _d = gui.Combobox(rb_aa_box, "fv2.sraa.dir", "Direction", "Off", "Triangle", "Modern", "Dashes")
+        _G._fv2_sraa_rb = {
+            one_kb  = gui.Keybox     (rb_aa_box, "fv2.sraa.onekb",  "AA Key",         0),
+            left    = gui.Keybox     (rb_aa_box, "fv2.sraa.left",   "AA Left",        0),
+            right   = gui.Keybox     (rb_aa_box, "fv2.sraa.right",  "AA Right",       0),
+            fwd_kb  = gui.Keybox     (rb_aa_box, "fv2.sraa.fwdkb", "Forward",        0),
+            angle   = gui.Slider     (rb_aa_box, "fv2.sraa.angle",  "Manual Angle",   23, 0, 90, 1),
+            one     = gui.Checkbox   (rb_aa_box, "fv2.sraa.one",    "Singular",       false),
+            dir     = _d,
+            dir_col = gui.ColorPicker(_d, "fv2.sraa.dir.col", "", 255, 255, 255, 255),
+            dir_size = gui.Slider    (rb_aa_box, "fv2.sraa.dir.size", "  Dir Size", 16, 8, 48, 1),
+            dir_gap  = gui.Slider    (rb_aa_box, "fv2.sraa.dir.gap",  "  Dir Gap",  60, 10, 200, 1),
+        }
+        local _rb = _G._fv2_sraa_rb
+        _rb.one_kb  :SetInvisible(true)
+        _rb.left    :SetInvisible(true)
+        _rb.right   :SetInvisible(true)
+        _rb.fwd_kb  :SetInvisible(true)
+        _rb.angle   :SetInvisible(true)
+        _rb.one     :SetInvisible(true)
+        _rb.dir     :SetInvisible(true)
+        _rb.dir_size:SetInvisible(true)
+        _rb.dir_gap :SetInvisible(true)
+    end
+
+    local aa_fwd           = gui.Keybox  (rb_aa_box, "fv2.rb.aa.fwd",   "AA Backward",    0)
+    local aa_left          = gui.Keybox  (rb_aa_box, "fv2.rb.aa.left",  "AA Left",        0)
+    local aa_right         = gui.Keybox  (rb_aa_box, "fv2.rb.aa.right", "AA Right",       0)
+    local aa_yaw           = gui.Combobox(rb_aa_box, "fv2.rb.aa.yaw",   "Yaw Type",       "Off", "Backwards")
+    local aa_pitch         = gui.Combobox(rb_aa_box, "fv2.rb.aa.pitch", "Pitch Type",     "Off", "Down", "Up", "Zero", "Up + Down Jitter")
+    local aa_dir_multi     = gui.Multibox(rb_aa_box, "Directions")
+    local aa_dir_tgt       = gui.Checkbox(aa_dir_multi, "fv2.rb.aa.dir.tgt",   "At Targets", false)
+    local aa_dir_edges     = gui.Checkbox(aa_dir_multi, "fv2.rb.aa.dir.edges", "At Edges",   false)
+    -- ── Fwd override ──────────────────────────────────────────────────
+    -- ── Yaw Presets: selector de dirección a configurar ───────────────
+    -- Selecciona qué dirección editás. El preset + sub-sliders aplican
+    -- SOLO cuando se presiona el bind de esa dirección (o neutro=Backwards).
+    local aa_dir_sel = gui.Combobox(rb_aa_box, "fv2.rb.aa.dir.sel",
+        "Yaw Presets", "Backwards", "Right", "Left")
+    -- ── Tres combos de preset, uno por dirección (show/hide por aa_dir_sel) ──
+    -- Backwards = neutro (ningún bind activo)  →  key legacy: fv2.rb.aa.yaw_preset
+    local aa_yaw_preset_back  = gui.Combobox(rb_aa_box, "fv2.rb.aa.yaw_preset",       "  Preset",
+        "Disabled", "Spinbot", "Jitter", "Random", "Moonwalk")
+    local aa_yaw_preset_right = gui.Combobox(rb_aa_box, "fv2.rb.aa.yaw_preset.right", "  Preset",
+        "Disabled", "Spinbot", "Jitter", "Random", "Moonwalk")
+    local aa_yaw_preset_left  = gui.Combobox(rb_aa_box, "fv2.rb.aa.yaw_preset.left",  "  Preset",
+        "Disabled", "Spinbot", "Jitter", "Random", "Moonwalk")
+    -- Alias para compatibilidad con código que lee aa_yaw_preset (estado neutro)
+    local aa_yaw_preset = aa_yaw_preset_back
+
+    local aa_fs_en_main    -- forward-decl: asignado en IIFE abajo
+    -- Visibilidad de aa_fwd/left/right/yaw/pitch/dir_multi/dir_sel manejada por fv2_aa_ext_vis (test2_active)
+
+    local _aa_manual_state  = 0
+    local _aa_was_on        = false
+
+    -- IIFE: Yaw Presets sliders + Anti-Invalid + No AA on Shot + Freestanding
+    ;(function()
+        local x_yaw_offset   = gui.Slider  (rb_aa_box, "fv2.rb.aa.yaw_offset",   "  Yaw Offset",   0,   -180, 180, 0.1)
+        local x_spin_speed   = gui.Slider  (rb_aa_box, "fv2.rb.aa.spin_speed",   "  Spin Speed",  -5,    -45,  45, 0.1)
+        local x_jitter_range = gui.Slider  (rb_aa_box, "fv2.rb.aa.jitter_range", "  Jitter Range", 30,     0,  90, 1  )
+        local x_jitter_tick  = gui.Slider  (rb_aa_box, "fv2.rb.aa.jitter_tick",  "  Jitter Speed",  4,     2,  32, 2  )
+        local x_anti_invalid = nil  -- removido del GUI; clamp siempre activo en PreMove
+        local x_fix_shot     = nil  -- removido del GUI; No AA on Shot desactivado
+
+        -- ── Disable Conditions ────────────────────────────────────────────
+        local aa_dc_multi   = gui.Multibox(rb_aa_box, "Disable")
+        local aa_dc_onkey   = gui.Checkbox(aa_dc_multi, "fv2.rb.aa.dc.onkey",    "On Key",     false)
+        local aa_dc_onknife = gui.Checkbox(aa_dc_multi, "fv2.rb.aa.dc.onknife",  "Knife",     false)
+        local aa_dc_ongren  = gui.Checkbox(aa_dc_multi, "fv2.rb.aa.dc.ongren",   "Nade",      false)
+        local aa_dc_keybox  = gui.Keybox  (rb_aa_box,   "fv2.rb.aa.dc.key",      "  Disable Key", 0)
+        _G._fv2_aa_dc = { onkey = aa_dc_onkey, onknife = aa_dc_onknife, ongren = aa_dc_ongren,
+                           keybox = aa_dc_keybox, multi = aa_dc_multi }
+        aa_dc_multi :SetInvisible(true)
+        aa_dc_keybox:SetInvisible(true)
+        -- ─────────────────────────────────────────────────────────────
+
+        aa_fs_en_main        = gui.Checkbox(rb_aa_box, "fv2.rb.freestanding",    "Freestanding",  false)
+
+        x_yaw_offset  :SetInvisible(true)
+        x_spin_speed  :SetInvisible(true)
+        x_jitter_range:SetInvisible(true)
+        x_jitter_tick :SetInvisible(true)
+        -- Anti-Invalid y No AA on Shot removidos del GUI
+        aa_fs_en_main :SetInvisible(true)
+        -- Los 3 preset combos empiezan ocultos; fv2_aa_ext_vis muestra el correcto
+        aa_yaw_preset_back :SetInvisible(true)
+        aa_yaw_preset_right:SetInvisible(true)
+        aa_yaw_preset_left :SetInvisible(true)
+
+        _G._fv2_aa_ext = {
+            yaw_offset   = x_yaw_offset,
+            spin_speed   = x_spin_speed,
+            jitter_range = x_jitter_range,
+            jitter_tick  = x_jitter_tick,
+            anti_invalid = nil,   -- removido, clamp siempre activo
+            fix_shot     = nil,   -- removido
+        }
+
+        local _last_preset = -1
+        callbacks.Register("Draw", "fv2_aa_ext_vis", function()
+            pcall(function()
+                local ext = _G._fv2_aa_ext; if not ext then return end
+                local dir_sel = aa_dir_sel:GetValue()
+
+                local rage_on      = test4_en:GetValue()
+                local cat_val      = test4_cat:GetValue()
+
+                -- Test2 (cat==0): muestra opciones AA directo; Test3 (cat==1): muestra Angle Override directo
+                local test2_active = rage_on and cat_val == 1
+                local test3_active = rage_on and cat_val == 0
+                local aa_visible   = test2_active  -- sin toggle intermedio
+
+                -- Test3: mostrar/ocultar hijos de Angle Override directo
+                local _rb = _G._fv2_sraa_rb
+                if _rb then
+                    _rb.one_kb:SetInvisible(not test3_active)
+                    _rb.left  :SetInvisible(not test3_active)
+                    _rb.right :SetInvisible(not test3_active)
+                    _rb.fwd_kb:SetInvisible(not test3_active)
+                    _rb.angle :SetInvisible(not test3_active)
+                    _rb.one   :SetInvisible(not test3_active)
+                    -- Direction removido de AA Legit: lo maneja Arrow Legit en aa_fs_box
+                    _rb.dir     :SetInvisible(true)
+                    _rb.dir_size:SetInvisible(true)
+                    _rb.dir_gap :SetInvisible(true)
+                end
+
+                -- Mostrar solo el preset combo de la dirección seleccionada
+                aa_yaw_preset_back :SetInvisible(not aa_visible or dir_sel ~= 0)
+                aa_yaw_preset_right:SetInvisible(not aa_visible or dir_sel ~= 1)
+                aa_yaw_preset_left :SetInvisible(not aa_visible or dir_sel ~= 2)
+
+                -- Preset activo para la dirección mostrada
+                local cur_preset
+                if     dir_sel == 1 then cur_preset = aa_yaw_preset_right:GetValue()
+                elseif dir_sel == 2 then cur_preset = aa_yaw_preset_left:GetValue()
+                else                     cur_preset = aa_yaw_preset_back:GetValue()
+                end
+
+                -- Defaults convenientes al cambiar de preset
+                if cur_preset ~= _last_preset then
+                    if cur_preset == 1 then ext.spin_speed   :SetValue(-5)                           end
+                    if cur_preset == 2 then ext.jitter_range :SetValue(30); ext.jitter_tick:SetValue(4) end
+                    _last_preset = cur_preset
+                end
+
+                -- Sub-sliders: visibles según el preset de la dirección actualmente editada
+                -- 0=Disabled, 1=Spinbot, 2=Jitter, 3=Random, 4=Moonwalk  (Custom Yaw eliminado)
+                -- Ocultar elementos del bind_master de aa_enable si Test2 no activo
+                aa_fwd      :SetInvisible(not test2_active)
+                aa_left     :SetInvisible(not test2_active)
+                aa_right    :SetInvisible(not test2_active)
+                aa_yaw      :SetInvisible(not test2_active)
+                aa_pitch    :SetInvisible(not test2_active)
+                aa_dir_multi:SetInvisible(not test2_active)
+                aa_dir_sel  :SetInvisible(not test2_active)
+                ext.spin_speed  :SetInvisible(not aa_visible or cur_preset ~= 1)
+                ext.jitter_range:SetInvisible(not aa_visible or cur_preset ~= 2)
+                ext.jitter_tick :SetInvisible(not aa_visible or cur_preset ~= 2)
+                -- Anti-Invalid y No AA on Shot removidos del GUI
+                aa_fs_en_main   :SetInvisible(not aa_visible)
+                -- Disable Conditions: visible cuando AA Rage activo
+                local dc = _G._fv2_aa_dc
+                if dc then
+                    dc.multi:SetInvisible(not aa_visible)
+                    -- Keybox solo si On Key está marcado
+                    local show_kb = aa_visible and dc.onkey:GetValue()
+                    dc.keybox:SetInvisible(not show_kb)
+                end
+                -- Disable para AA Legit: visible cuando AA Legit activo
+                local ldc = _G._fv2_legit_dc
+                if ldc then
+                    ldc.multi:SetInvisible(not test3_active)
+                    local show_lkb = test3_active and ldc.onkey:GetValue()
+                    ldc.keybox:SetInvisible(not show_lkb)
+                end
+            end)
+        end)
+    end)()
+
+    -- Min Dmg: columna IZQUIERDA, debajo del category box
+    local rb_right = gui.Groupbox(win, "Accuracy", BORDER, CY, CW, WIN_H - CY - BORDER)
+    reg_group(3, rb_right)
+
+    local rb_dmg_feature = gui.Checkbox(rb_right, "fv2.rb.dmgfeat", "Min Damage", false)
+
+    local rb_wep_combo = gui.Combobox(rb_right, "fv2.rb.weapon", "Weapon",
+        "Shared","Zeus","Pistol","Heavy Pistol","Sub Machine",
+        "Rifle","Shotgun","Scout","Auto Sniper","Sniper","Light Machine")
+
+    local rb_mdmg_def    = {60, 55, 35, 45, 28, 45, 22, 75, 55, 100, 22}
+    local rb_mdmg_labels = {"  Shared","  Zeus","  Pistol","  Heavy Pistol","  SMG",
+                             "  Rifle","  Shotgun","  Scout","  Auto Sniper","  Sniper","  LMG"}
+    local rb_mdmg = {}
+    for i = 1, #rb_wep_groups do
+        rb_mdmg[i] = gui.Slider(rb_right, "fv2.rb.mdmg."..i, rb_mdmg_labels[i],
+                                rb_mdmg_def[i] or 40, 1, 130, 1)
+        rb_mdmg[i]:SetInvisible(true)
+    end
+
+    local rb_override_en  = {}
+    local rb_override_val = {}
+    for i = 1, #rb_wep_groups do
+        rb_override_en[i]  = gui.Checkbox(rb_right, "fv2.rb.override.en."..i,  "Override dmg", false)
+        rb_override_val[i] = gui.Slider  (rb_right, "fv2.rb.override.val."..i, "  Value",       40, 1, 130, 1)
+        rb_override_en[i] :SetInvisible(true)
+        rb_override_val[i]:SetInvisible(true)
+    end
+
+    rb_wep_combo:SetInvisible(true)
+    -- rb_override_en/val: visibilidad gestionada por arma en fv2_rb_wepsel
+    bind_master(rb_dmg_feature, { rb_wep_combo })
+
+    -- ================================================================
+    -- TAB 4: AA — columna derecha: Keybind AA + AA Indicator
+    -- ================================================================
+    -- Shared: actualizado en fv2_aa_draw, leído en fv2_draw para indicadores
+
+    do
+        local aa_fs_box = gui.Groupbox(win, "Feature Rage", BORDER, CY, CW, WIN_H - CY - BORDER)
+        reg_group(4, aa_fs_box)
+
+        local aa_fs_en  = aa_fs_en_main  -- referencia al widget creado en rb_aa_box
+
+        -- ── Custom Arrow (Angle Manipulation panel, sigue en aa_fs_box) ──
+        local aa_ind_custom    = gui.Checkbox(aa_fs_box, "fv2.aa.ind.custom",    "  Custom Arrow", false)
+        local aa_ind_cust_size = gui.Slider  (aa_fs_box, "fv2.aa.ind.cust.size", "    Size", 16, 8, 48, 1)
+        local aa_ind_cust_gap  = gui.Slider  (aa_fs_box, "fv2.aa.ind.cust.gap",  "    Gap",  60, 10, 200, 1)
+        aa_ind_custom   :SetInvisible(true)
+        aa_ind_cust_size:SetInvisible(true)
+        aa_ind_cust_gap :SetInvisible(true)
+        -- Visibilidad de Size/Gap se maneja en Draw (Custom Arrow ON o Direction != Off)
+        local _sraa_state = 0  -- 0=neutro, 1=left, 2=right
+
+        -- Expose al scope global — apunta a _G._fv2_sraa_rb (rb_aa_box, Test3)
+        local _rb2 = _G._fv2_sraa_rb
+        _G._fv2_sraa = {
+            enable  = nil,   -- sin toggle: activo cuando test3_active
+            left    = _rb2.left,
+            right   = _rb2.right,
+            angle   = _rb2.angle,
+            one     = _rb2.one,
+            one_kb  = _rb2.one_kb,
+            fwd_kb  = _rb2.fwd_kb,
+            dir     = _rb2.dir,
+            dir_col = _rb2.dir_col,
+            state   = function() return _sraa_state end,
+            set     = function(v) _sraa_state = v end,
+        }
+
+        -- ── NO: elige entre Arrow Rage y Arrow Legit ──
+        local aa_no_cb  = gui.Checkbox(aa_fs_box, "fv2.aa.no.en",  "Arrow",  false)
+        local aa_no_sel = gui.Combobox(aa_fs_box, "fv2.aa.no.sel", "  Mode", "Arrow Legit", "Arrow Rage")
+        aa_no_sel:SetInvisible(true)
+        bind_master(aa_no_cb, { aa_no_sel })
+        _G._fv2_aa_no_cb  = aa_no_cb
+        _G._fv2_aa_no_sel = aa_no_sel
+
+        -- ── Arrow Rage: Style / Size / Gap ──
+        local aa_ind_type = gui.Combobox   (aa_fs_box, "fv2.aa.ind.type", "  Style",
+            "Off", "Triangle", "Modern", "Dashes", "Poly", "Hollow",
+            "Chevron", "Arrow")
+        local aa_ind_col  = gui.ColorPicker(aa_ind_type, "fv2.aa.ind.col", "", 255, 255, 255, 255)
+        local aa_ind_size = gui.Slider     (aa_fs_box, "fv2.aa.ind.size", "  Size",  16, 8, 48, 1)
+        local aa_ind_gap  = gui.Slider     (aa_fs_box, "fv2.aa.ind.gap",  "  Gap",   60, 10, 200, 1)
+        aa_ind_type:SetInvisible(true)
+        aa_ind_size:SetInvisible(true)
+        aa_ind_gap :SetInvisible(true)
+
+        -- ── Arrow Legit: Direction / Size / Gap ──
+        local aa_t8_dir  = gui.Combobox(aa_fs_box, "fv2.aa.t8.dir", "  Direction",
+            "Off", "Triangle", "Modern", "Dashes")
+        local aa_t8_col  = gui.ColorPicker(aa_t8_dir, "fv2.aa.t8.dir.col", "", 255, 255, 255, 255)
+        local aa_t8_size = gui.Slider(aa_fs_box, "fv2.aa.t8.size", "  Size", 16, 8, 48, 1)
+        local aa_t8_gap  = gui.Slider(aa_fs_box, "fv2.aa.t8.gap",  "  Gap",  60, 10, 200, 1)
+        aa_t8_dir :SetInvisible(true)
+        aa_t8_size:SetInvisible(true)
+        aa_t8_gap :SetInvisible(true)
+        _G._fv2_aa_t8 = { dir = aa_t8_dir, col = aa_t8_col, size = aa_t8_size, gap = aa_t8_gap }
+
+        -- Hide on Scope: debajo de Gap (ambos modos)
+        local aa_ind_hidescope = gui.Checkbox(aa_fs_box, "fv2.aa.ind.hidescope", "  Hide on Scope", false)
+        aa_ind_hidescope:SetInvisible(true)
+
+        -- Callback: swap Test7 <-> Test8
+        local _no_last = { no=nil, sel=nil, dir=nil, sty=nil }
+        callbacks.Register("Draw", "fv2_aa_no_upd", function()
+            pcall(function()
+                local no_on = aa_no_cb:GetValue()
+                local sel   = aa_no_sel:GetValue()
+                local t8    = _G._fv2_aa_t8
+                local dir_v = (t8 and sel == 0 and no_on) and t8.dir:GetValue() or 0
+                local sty_v = (no_on and sel == 1) and aa_ind_type:GetValue() or 0
+                if no_on == _no_last.no and sel == _no_last.sel
+                   and dir_v == _no_last.dir and sty_v == _no_last.sty then return end
+                _no_last.no = no_on; _no_last.sel = sel
+                _no_last.dir = dir_v; _no_last.sty = sty_v
+
+                local show7 = no_on and sel == 1
+                local show8 = no_on and sel == 0
+
+                -- Hide on Scope: siempre visible cuando Arrow está ON
+                aa_ind_hidescope:SetInvisible(not no_on)
+
+                -- Arrow Rage: Style siempre visible; Size/Gap solo si Style != Off
+                local style_on = show7 and (aa_ind_type:GetValue() > 0)
+                aa_ind_type:SetInvisible(not show7)
+                aa_ind_size:SetInvisible(not style_on)
+                aa_ind_gap :SetInvisible(not style_on)
+
+                -- Test 8: widgets locales en aa_fs_box
+                if t8 then
+                    t8.dir :SetInvisible(not show8)
+                    local dir_on = show8 and (t8.dir:GetValue() > 0)
+                    t8.size:SetInvisible(not dir_on)
+                    t8.gap :SetInvisible(not dir_on)
+                end
+            end)
+        end)
+
+        -- Fuentes pre-creadas al cargar (NUNCA dentro de Draw)
+        local _aa_fonts = {}
+        for _, sz in ipairs({8,10,12,14,16,18,20,22,24,28,32,36,40,48}) do
+            pcall(function() _aa_fonts[sz] = draw.CreateFont("Segoe UI Symbol", sz, 700) end)
+        end
+        local _aa_font_cache    = { sz = -1, font = nil }
+        local function _get_aa_font(sz)
+            if sz == _aa_font_cache.sz then return _aa_font_cache.font end
+            local best, bd = _aa_fonts[8], 999
+            for s, f in pairs(_aa_fonts) do
+                if math.abs(s - sz) < bd then best = f; bd = math.abs(s - sz) end
+            end
+            _aa_font_cache.sz   = sz
+            _aa_font_cache.font = best
+            return best
+        end
+
+        local _symbols = {
+            -- Off (0): sin simbolos
+            [1] = { r = "▶",  l = "◀",  d = "▼",  f = "▼"  },  -- Triangle
+            [2] = { r = "⮚",  l = "⮘",  d = "⮛",  f = "⮛"  },  -- Modern
+            [3] = { r = "‒",  l = "‒",  d = "╵",  f = "‒"  },  -- Dashes
+            -- [4]=Poly y [5]=Hollow usan dibujo custom (FilledRect), no unicode
+        }
+
+        callbacks.Register("Draw", "fv2_aa_draw", function()
+            pcall(function()
+                -- Arrows se siguen viendo con TAB; solo se ocultan en pausa
+                local _paused = false
+                pcall(function() _paused = engine.IsPaused() == true end)
+                if _paused then return end
+                -- Semi-Rage AA key handling (igual que frog: toggle por press)
+                pcall(function()
+                    local sr = _G._fv2_sraa
+                    if sr and test4_en:GetValue() and test4_cat:GetValue() == 0 then
+                        local one_mode = sr.one:GetValue()
+                        -- Visibilidad: Singular oculta AA Left/Right y muestra AA Key
+                        sr.left   :SetInvisible(one_mode)
+                        sr.right  :SetInvisible(one_mode)
+                        sr.fwd_kb :SetInvisible(not one_mode)
+                        sr.one_kb :SetInvisible(not one_mode)
+                        -- Forward held: fuerza neutro (mira adelante)
+                        local fk = sr.fwd_kb:GetValue()
+                        local fk_held = (tonumber(fk) or 0) > 0 and input.IsButtonDown(fk)
+                        if fk_held then
+                            sr.set(0)
+                        elseif one_mode then
+                            -- Un solo keybind: alterna solo izquierda <-> derecha (sin neutro)
+                            local ok = sr.one_kb:GetValue()
+                            if (tonumber(ok) or 0) > 0 and input.IsButtonPressed(ok) then
+                                sr.set(sr.state() == 1 and 2 or 1)
+                            end
+                        else
+                            -- Modo normal: 2 keybinds independientes
+                            local lk = sr.left:GetValue()
+                            local rk = sr.right:GetValue()
+                            if (tonumber(lk) or 0) > 0 and input.IsButtonPressed(lk) then
+                                sr.set(sr.state() == 1 and 0 or 1)
+                            end
+                            if (tonumber(rk) or 0) > 0 and input.IsButtonPressed(rk) then
+                                sr.set(sr.state() == 2 and 0 or 2)
+                            end
+                        end
+                    end
+                end)
+
+                -- Bloquear AA nativo de Aimware cuando AA Rage está activo
+                if test4_en:GetValue() and test4_cat:GetValue() == 1 then
+                    sv("rbot.antiaim.enabled", false)
+                    pcall(function() gui.SetValue("rbot.antiaim.enabled", false) end)
+                end
+
+                -- Freestanding: visible solo cuando Anti-Aim está ON
+                aa_fs_en_main:SetInvisible(not (test4_en:GetValue() and test4_cat:GetValue() == 1))
+                -- Freestand: aplica independientemente de Arrow y Anti-Aim
+                local fs_val = aa_fs_en:GetValue()
+                _fv2_fs_active = fs_val   -- cache para fv2_draw (indicador FS)
+                -- FIX: freestanding = aa_fs_en (multibox) OR aa_fs_en_main (standalone)
+                local _fs_combined = fs_val or aa_fs_en_main:GetValue()
+                sv("antiaim.freestand",          _fs_combined)
+                sv("rbot.aa.freestand",           _fs_combined)
+                sv("rbot.antiaim.autodir.edges",  aa_dir_edges:GetValue() or _fs_combined)
+
+                -- Siempre actualizar is_back para el indicador panel
+                local _fwd_k = aa_fwd:GetValue()
+                local _fwd_down = ((tonumber(_fwd_k) or 0) > 0 and input.IsButtonDown(_fwd_k))
+
+                -- Shared state: actualizar siempre, independiente del modo Arrow activo
+                do
+                    local _typ_sh = (aa_ind_type and aa_ind_type:GetValue()) or 0
+                    local _isback = _fwd_down or (test4_en:GetValue() and test4_cat:GetValue() == 1 and aa_yaw:GetValue() == 1)
+                    local _csym   = _symbols[_typ_sh] or _symbols[1] or { r="\226\150\182", l="\226\151\128", d="\226\150\188" }
+                    _aa_ind_shared.sym_r   = _csym.r
+                    _aa_ind_shared.sym_l   = _csym.l
+                    _aa_ind_shared.sym_d   = _csym.d
+                    _aa_ind_shared.is_back = _isback and (_aa_manual_state == 0)
+                end
+
+                -- Arrow Rage draw (sel==1): encapsulado en pcall propio para no bloquear Arrow Legit
+                pcall(function()
+                -- Arrow Rage: el combobox puede devolver 0 o 1 segun runtime de Aimware
+                -- Probamos el valor que NO usa Arrow Legit (sel==0 es Arrow Legit)
+                local _no_cb_on = _G._fv2_aa_no_cb and _G._fv2_aa_no_cb:GetValue()
+                local _no_sel   = _G._fv2_aa_no_sel and _G._fv2_aa_no_sel:GetValue()
+                if not _no_cb_on then return end
+                if _no_sel == 0 then return end  -- 0 = Arrow Legit, no dibujar aqui
+                local lp = nil
+                pcall(function() lp = entities.GetLocalPawn() end)
+                if not lp or not lp:IsAlive() then return end
+
+                if aa_ind_hidescope:GetValue() then
+                    local _sc = false
+                    pcall(function() _sc = lp:GetFieldBool("m_bIsScoped") == true end)
+                    if _sc then return end
+                end
+
+                local sz   = aa_ind_size:GetValue()
+                local gap  = aa_ind_gap :GetValue()
+                if aa_ind_custom:GetValue() then
+                    sz  = aa_ind_cust_size:GetValue()
+                    gap = aa_ind_cust_gap :GetValue()
+                end
+                local typ  = aa_ind_type:GetValue()
+                local r, g, b, a = aa_ind_col:GetValue()
+                local sym  = _symbols[typ]
+
+                local sw, sh = draw.GetScreenSize()
+                local cx, cy = math.floor(sw / 2), math.floor(sh / 2)
+
+                local _aa_f = _get_aa_font(sz)
+                if not _aa_f then return end
+                draw.SetFont(_aa_f)
+
+                local is_naturally_back = _fwd_down or (test4_en:GetValue() and test4_cat:GetValue() == 1 and aa_yaw:GetValue() == 1)
+
+                -- Si style es Off (typ==0): no dibujar
+                if typ == 0 then return end
+
+                -- Arrow dibuja si AA Rage (toggle del script) esta activo
+                local aa_is_on = test4_en:GetValue() and test4_cat:GetValue() == 1
+                if not aa_is_on then return end
+
+                -- Direccion segun keybinds manuales
+                -- El arrow sigue la VISTA del jugador (no la nuca del AA):
+                -- state==1 = AA Left (nuca izq) → cara mira derecha → arrow right
+                -- state==2 = AA Right (nuca der) → cara mira izquierda → arrow left
+                -- show_down: AA Backward presionado  O  Yaw Type=Backwards en estado neutro
+                local show_down  = is_naturally_back and (_aa_manual_state == 0)
+                local show_right = (_aa_manual_state == 1) and not _fwd_down
+                local show_left  = (_aa_manual_state == 2) and not _fwd_down
+                if _fwd_down then show_down=true; show_right=false; show_left=false end
+
+                if not show_right and not show_left and not show_down then return end
+
+                -- ── Poly (4) = filled triangle | Hollow (5) = outline triangle ──
+                if typ == 4 or typ == 5 then
+                    local outline = (typ == 5)
+                    local sa = math.min(255, math.floor(a * 0.6))
+
+                    local function poly_right(ox, oy)
+                        draw.Color(0, 0, 0, sa)
+                        for col = 0, sz do
+                            local h = math.floor(sz * (1 - col / sz) + 0.5)
+                            local y1 = oy - math.floor(h / 2)
+                            draw.FilledRect(ox+col+1, y1+1, ox+col+2, y1+h+1)
+                        end
+                        draw.Color(r, g, b, a)
+                        for col = 0, sz do
+                            local h = math.floor(sz * (1 - col / sz) + 0.5)
+                            local y1 = oy - math.floor(h / 2)
+                            if outline then
+                                if col == 0 or col == sz then
+                                    draw.FilledRect(ox+col, y1, ox+col+1, y1+h)
+                                else
+                                    draw.FilledRect(ox+col, y1,     ox+col+1, y1+1)
+                                    draw.FilledRect(ox+col, y1+h-1, ox+col+1, y1+h)
+                                end
+                            else
+                                draw.FilledRect(ox+col, y1, ox+col+1, y1+h)
+                            end
+                        end
+                    end
+
+                    local function poly_left(ox, oy)
+                        draw.Color(0, 0, 0, sa)
+                        for col = 0, sz do
+                            local h = math.floor(sz * (1 - col / sz) + 0.5)
+                            local y1 = oy - math.floor(h / 2)
+                            draw.FilledRect(ox-col, y1+1, ox-col+1, y1+h+1)
+                        end
+                        draw.Color(r, g, b, a)
+                        for col = 0, sz do
+                            local h = math.floor(sz * (1 - col / sz) + 0.5)
+                            local y1 = oy - math.floor(h / 2)
+                            if outline then
+                                if col == 0 or col == sz then
+                                    draw.FilledRect(ox-col, y1, ox-col+1, y1+h)
+                                else
+                                    draw.FilledRect(ox-col, y1,     ox-col+1, y1+1)
+                                    draw.FilledRect(ox-col, y1+h-1, ox-col+1, y1+h)
+                                end
+                            else
+                                draw.FilledRect(ox-col, y1, ox-col+1, y1+h)
+                            end
+                        end
+                    end
+
+                    local function poly_down(ox, oy)
+                        draw.Color(0, 0, 0, sa)
+                        for row = 0, sz do
+                            local w = math.floor(sz * (1 - row / sz) + 0.5)
+                            local x1 = ox - math.floor(w / 2)
+                            draw.FilledRect(x1+1, oy+row+1, x1+w+1, oy+row+2)
+                        end
+                        draw.Color(r, g, b, a)
+                        for row = 0, sz do
+                            local w = math.floor(sz * (1 - row / sz) + 0.5)
+                            local x1 = ox - math.floor(w / 2)
+                            if outline then
+                                if row == 0 or row == sz then
+                                    draw.FilledRect(x1, oy+row, x1+w, oy+row+1)
+                                else
+                                    draw.FilledRect(x1,     oy+row, x1+1,   oy+row+1)
+                                    draw.FilledRect(x1+w-1, oy+row, x1+w,   oy+row+1)
+                                end
+                            else
+                                draw.FilledRect(x1, oy+row, x1+w, oy+row+1)
+                            end
+                        end
+                    end
+
+                    if show_down then poly_down(cx, cy + gap)
+                    elseif show_right then poly_right(cx + gap, cy)
+                    elseif show_left then poly_left(cx - gap, cy)
+                    end
+                    return
+                end
+
+                -- ── Chevron (6) ── doble chevron con draw.Line ───────────
+                if typ == 6 then
+                    local hs   = math.floor(sz / 2)
+                    local hs2  = math.floor(sz * 0.6)
+                    local gap2 = math.floor(sz * 0.38)
+                    local sa   = math.min(255, math.floor(a * 0.55))
+                    local function chev_pair(x1,y1,x2,y2)
+                        draw.Color(0,0,0,sa)
+                        draw.Line(x1+1,y1+1,x2+1,y2+1)
+                        draw.Line(x1+2,y1+1,x2+2,y2+1)
+                        draw.Color(r,g,b,a)
+                        draw.Line(x1,y1,x2,y2)
+                        draw.Line(x1+1,y1,x2+1,y2)
+                    end
+                    if show_right then
+                        local ox = cx + gap
+                        chev_pair(ox,        cy-hs, ox+hs2, cy)
+                        chev_pair(ox,        cy+hs, ox+hs2, cy)
+                        chev_pair(ox+gap2,   cy-hs, ox+gap2+hs2, cy)
+                        chev_pair(ox+gap2,   cy+hs, ox+gap2+hs2, cy)
+                    elseif show_left then
+                        local ox = cx - gap
+                        chev_pair(ox,        cy-hs, ox-hs2, cy)
+                        chev_pair(ox,        cy+hs, ox-hs2, cy)
+                        chev_pair(ox-gap2,   cy-hs, ox-gap2-hs2, cy)
+                        chev_pair(ox-gap2,   cy+hs, ox-gap2-hs2, cy)
+                    elseif show_down then
+                        local oy = cy + gap
+                        chev_pair(cx-hs, oy,       cx, oy+hs2)
+                        chev_pair(cx+hs, oy,       cx, oy+hs2)
+                        chev_pair(cx-hs, oy+gap2,  cx, oy+gap2+hs2)
+                        chev_pair(cx+hs, oy+gap2,  cx, oy+gap2+hs2)
+                    end
+                    return
+                end
+
+                -- ── Arrow (7) ── open outline arrow, 3px stroke ──────────
+                if typ == 7 then
+                    local hs = math.floor(sz * 0.55)
+                    local sa = math.min(255, math.floor(a * 0.45))
+                    local function arrow_line(x1,y1,x2,y2)
+                        draw.Color(0,0,0,sa)
+                        draw.Line(x1+1,y1+1,x2+1,y2+1)
+                        draw.Line(x1+2,y1+1,x2+2,y2+1)
+                        draw.Line(x1+3,y1+1,x2+3,y2+1)
+                        draw.Color(r,g,b,a)
+                        draw.Line(x1,  y1,  x2,  y2)
+                        draw.Line(x1+1,y1,  x2+1,y2)
+                        draw.Line(x1+2,y1,  x2+2,y2)
+                    end
+                    if show_right then
+                        local ox = cx + gap
+                        arrow_line(ox, cy-hs, ox+hs, cy)
+                        arrow_line(ox, cy+hs, ox+hs, cy)
+                    elseif show_left then
+                        local ox = cx - gap
+                        arrow_line(ox, cy-hs, ox-hs, cy)
+                        arrow_line(ox, cy+hs, ox-hs, cy)
+                    elseif show_down then
+                        local oy = cy + gap
+                        arrow_line(cx-hs, oy, cx, oy+hs)
+                        arrow_line(cx+hs, oy, cx, oy+hs)
+                    end
+                    return
+                end
+
+                -- Estilos unicode (Triangle, Modern, Dashes)
+                if not sym then return end
+                local sym_r = sym.r
+                local sym_l = sym.l
+                local sym_d = sym.d or "▼"
+                local tw_r, th_r = draw.GetTextSize(sym_r)
+                local tw_l       = draw.GetTextSize(sym_l)
+                local tw_d       = draw.GetTextSize(sym_d)
+                local ty = cy - math.floor(th_r / 2)
+
+                if show_right then
+                    draw.Color(0, 0, 0, math.min(255, math.floor(a * 0.6)))
+                    draw.Text(cx + gap + 1, ty + 1, sym_r)
+                    draw.Color(r, g, b, a)
+                    draw.Text(cx + gap, ty, sym_r)
+                elseif show_left then
+                    draw.Color(0, 0, 0, math.min(255, math.floor(a * 0.6)))
+                    draw.Text(cx - gap - tw_l + 1, ty + 1, sym_l)
+                    draw.Color(r, g, b, a)
+                    draw.Text(cx - gap - tw_l, ty, sym_l)
+                elseif show_down then
+                    local dx = cx - math.floor(tw_d / 2)
+                    local dy = cy + gap
+                    draw.Color(0, 0, 0, math.min(255, math.floor(a * 0.6)))
+                    draw.Text(dx + 1, dy + 1, sym_d)
+                    draw.Color(r, g, b, a)
+                    draw.Text(dx, dy, sym_d)
+                end
+                end) -- cierre pcall Arrow Rage
+
+                -- ── Arrow Legit draw (sel==0) ─────────────────────────────
+                pcall(function()
+                    local no_on  = _G._fv2_aa_no_cb  and _G._fv2_aa_no_cb:GetValue()
+                    local sel    = _G._fv2_aa_no_sel  and _G._fv2_aa_no_sel:GetValue()
+                    if not (no_on and sel == 0) then return end
+                    local t8 = _G._fv2_aa_t8; if not t8 then return end
+
+                    local typ = t8.dir:GetValue()
+                    if typ == 0 then return end
+
+                    local lp8 = nil
+                    pcall(function() lp8 = entities.GetLocalPawn() end)
+                    if not lp8 or not lp8:IsAlive() then return end
+
+                    -- Hide on Scope compartido
+                    if aa_ind_hidescope:GetValue() then
+                        local _sc = false
+                        pcall(function() _sc = lp8:GetFieldBool("m_bIsScoped") == true end)
+                        if _sc then return end
+                    end
+
+                    -- Dirección: keybinds de AA Legit (_sraa_state)
+                    local sr = _G._fv2_sraa; if not sr then return end
+                    local show_right, show_left = false, false
+                    local one_mode = sr.one:GetValue()
+                    if one_mode then
+                        show_right = (sr.state() == 1)
+                        show_left  = (sr.state() == 2)
+                    else
+                        local lk = sr.left:GetValue()
+                        local rk = sr.right:GetValue()
+                        local lk_down = (tonumber(lk) or 0) > 0 and input.IsButtonDown(lk)
+                        local rk_down = (tonumber(rk) or 0) > 0 and input.IsButtonDown(rk)
+                        local st = sr.state()
+                        if     lk_down then show_right = true
+                        elseif rk_down then show_left  = true
+                        else show_right = (st == 1); show_left = (st == 2)
+                        end
+                    end
+                    if not show_right and not show_left then return end
+
+                    local r2, g2, b2, a2 = t8.col:GetValue()
+                    local sz2  = t8.size:GetValue()
+                    local gap2 = t8.gap :GetValue()
+                    local sw2, sh2 = draw.GetScreenSize()
+                    local cx2 = math.floor(sw2 / 2)
+                    local cy2 = math.floor(sh2 / 2)
+                    local _dir_syms = {
+                        [1] = { r = "▶", l = "◀" },
+                        [2] = { r = "⮚", l = "⮘" },
+                        [3] = { r = "‒", l = "‒" },
+                    }
+                    local sym2 = _dir_syms[typ]; if not sym2 then return end
+                    local font2 = _get_aa_font(sz2); if not font2 then return end
+                    draw.SetFont(font2)
+                    local sa2 = math.min(255, math.floor(a2 * 0.6))
+                    if show_right then
+                        local tw, th = draw.GetTextSize(sym2.l)
+                        local ty2 = cy2 - math.floor(th / 2)
+                        draw.Color(0, 0, 0, sa2)
+                        draw.Text(cx2 - gap2 - tw + 1, ty2 + 1, sym2.l)
+                        draw.Color(r2, g2, b2, a2)
+                        draw.Text(cx2 - gap2 - tw, ty2, sym2.l)
+                    elseif show_left then
+                        local tw, th = draw.GetTextSize(sym2.r)
+                        local ty2 = cy2 - math.floor(th / 2)
+                        draw.Color(0, 0, 0, sa2)
+                        draw.Text(cx2 + gap2 + 1, ty2 + 1, sym2.r)
+                        draw.Color(r2, g2, b2, a2)
+                        draw.Text(cx2 + gap2, ty2, sym2.r)
+                    end
+                end)
+        end)  -- cierre pcall exterior fv2_aa_draw
+        end)  -- cierre callbacks.Register fv2_aa_draw
+    end
+
+    callbacks.Register("Draw", "fv2_rb_wepsel", function()
+        pcall(function()
+            local feat_on = rb_dmg_feature:GetValue()
+            local sel     = rb_wep_combo:GetValue() + 1
+            local ovr     = feat_on and rb_override_en[sel] and rb_override_en[sel]:GetValue()
+            local lc      = _rb_wepsel_last
+            if lc.feat == feat_on and lc.sel == sel and lc.ovr == ovr then return end
+            lc.feat = feat_on; lc.sel = sel; lc.ovr = ovr
+            for i = 1, #rb_wep_groups do
+                local is_sel = feat_on and (i == sel)
+                rb_mdmg[i]       :SetInvisible(not is_sel)
+                rb_override_en[i]:SetInvisible(not is_sel)
+                rb_override_val[i]:SetInvisible(not (is_sel and rb_override_en[i]:GetValue()))
+            end
+        end)
+    end)
+
+    callbacks.Register("Draw", "fv2_rb_draw", function()
+        pcall(function()
+            local rage_on  = rb_rage_enable:GetValue()
+            -- legit_on: Trigger OR Autofire activos
+            local legit_on = kb_trigger:GetValue() or kb_autofire:GetValue()
+
+            -- Resolución de conflicto: el último en activarse apaga al otro
+            if rage_on and legit_on then
+                local rage_rising = rage_on and not _last_rage_state
+                if rage_rising then
+                    -- Rage recién activado → apagar legit
+                    kb_trigger:SetValue(false)
+                    kb_autofire:SetValue(false)
+                    legit_on = false
+                else
+                    -- Legit recién activado (o ambos simultáneos) → apagar rage
+                    rb_rage_enable:SetValue(false)
+                    rage_on = false
+                end
+            end
+
+
+            -- --------------------------------------------------------
+            -- Ragebot master: solo sincronizar al cambiar estado
+            -- FIX: aplicar cada frame pisaba el toggle nativo de Aimware
+            -- impidiendo clickearlo manualmente
+            -- --------------------------------------------------------
+            if rage_on ~= _last_rage_state or legit_on ~= _last_legit_state then
+                _last_rage_state  = rage_on
+                _last_legit_state = legit_on
+
+                pcall(function() gui.SetValue("rbot.master",       rage_on) end)
+                pcall(function() gui.SetValue("rbot.enabled",      rage_on) end)
+                pcall(function() gui.SetValue("rbot.enable",       rage_on) end)
+                pcall(function() gui.SetValue("rbot.main.enable",  rage_on) end)
+                pcall(function() gui.SetValue("rbot.main.enabled", rage_on) end)
+                pcall(function() gui.SetValue("rbot.main.master",  rage_on) end)
+
+                if rage_on and legit_on then
+                    -- conflicto ya resuelto arriba, solo apagar lbot
+                    sv("lbot.master",  false)
+                    sv("lbot.enable",  false)
+                    sv("lbot.enabled", false)
+                elseif legit_on then
+                    sv("rbot.master",        false)
+                    sv("rbot.enabled",       false)
+                    sv("rbot.enable",        false)
+                    sv("rbot.main.enable",   false)
+                    sv("rbot.main.enabled",  false)
+                    sv("rbot.main.master",   false)
+                end
+            end
+
+            -- Autowall Rage (independiente de rage_on para que funcione siempre)
+            do
+                local rb_aw_val = rb_autowall_enable:GetValue()
+                if rb_aw_val ~= _last_rb_autowall then
+                    _last_rb_autowall = rb_aw_val
+                    for _, grp in ipairs(rb_wep_groups) do
+                        sv("rbot.weapon."..grp..".autowall",           rb_aw_val)
+                        sv("rbot.hitscan.accuracy."..grp..".autowall", rb_aw_val)
+                        sv("rbot.accuracy."..grp..".autowall",         rb_aw_val)
+                    end
+                    sv("rbot.autowall", rb_aw_val)
+                end
+            end
+
+            -- Force Body: solo body.priority=1, todo lo demás apagado (igual que frog pero completo)
+            if rb_forcebody:GetValue() then
+                local grp = "shared"
+                pcall(function()
+                    local raw = tostring(gui.GetValue("rbot.accuracy") or ""):gsub('"',''):lower()
+                    local wmap = {["pistol"]="pistol",["heavy pistol"]="hpistol",
+                                  ["scout"]="scout",["auto sniper"]="asniper",
+                                  ["sniper"]="sniper",["smg"]="smg",["rifle"]="rifle",
+                                  ["shotgun"]="shotgun",["lmg"]="lmg",["zeus"]="zeus"}
+                    grp = wmap[raw] or "shared"
+                end)
+                -- Guardar TODOS los campos la primera vez o si cambió el arma
+                if _rb_fb_orig == nil or _rb_fb_orig_grp ~= grp then
+                    local b = "rbot.hitbox."..grp.."."
+                    local o = {}
+                    pcall(function() o.hp  = gui.GetValue(b.."head.priority")  end)
+                    pcall(function() o.he  = gui.GetValue(b.."head.exposed")   end)
+                    pcall(function() o.hc  = gui.GetValue(b.."head.center")    end)
+                    pcall(function() o.bp  = gui.GetValue(b.."body.priority")  end)
+                    pcall(function() o.bl  = gui.GetValue(b.."body.lethal")    end)
+                    pcall(function() o.be  = gui.GetValue(b.."body.exposed")   end)
+                    pcall(function() o.bc  = gui.GetValue(b.."body.center")    end)
+                    pcall(function() o.le  = gui.GetValue(b.."limbs.exposed")  end)
+                    pcall(function() o.lc  = gui.GetValue(b.."limbs.center")   end)
+                    _rb_fb_orig     = o
+                    _rb_fb_orig_grp = grp
+                end
+                -- Aplicar: solo body priority, todo lo demás OFF
+                local base = "rbot.hitbox."..grp.."."
+                pcall(function() gui.SetValue(base.."head.priority",  0) end)
+                pcall(function() gui.SetValue(base.."head.exposed",   0) end)
+                pcall(function() gui.SetValue(base.."head.center",    0) end)
+                pcall(function() gui.SetValue(base.."body.priority",  1) end)
+                pcall(function() gui.SetValue(base.."body.lethal",    0) end)
+                pcall(function() gui.SetValue(base.."body.exposed",   0) end)
+                pcall(function() gui.SetValue(base.."body.center",    0) end)
+                pcall(function() gui.SetValue(base.."limbs.exposed",  0) end)
+                pcall(function() gui.SetValue(base.."limbs.center",   0) end)
+            elseif _rb_fb_orig ~= nil then
+                -- Restaurar TODOS los campos al desactivar
+                local grp = _rb_fb_orig_grp or "shared"
+                local base = "rbot.hitbox."..grp.."."
+                local o = _rb_fb_orig
+                pcall(function() gui.SetValue(base.."head.priority",  o.hp) end)
+                pcall(function() gui.SetValue(base.."head.exposed",   o.he) end)
+                pcall(function() gui.SetValue(base.."head.center",    o.hc) end)
+                pcall(function() gui.SetValue(base.."body.priority",  o.bp) end)
+                pcall(function() gui.SetValue(base.."body.lethal",    o.bl) end)
+                pcall(function() gui.SetValue(base.."body.exposed",   o.be) end)
+                pcall(function() gui.SetValue(base.."body.center",    o.bc) end)
+                pcall(function() gui.SetValue(base.."limbs.exposed",  o.le) end)
+                pcall(function() gui.SetValue(base.."limbs.center",   o.lc) end)
+                _rb_fb_orig     = nil
+                _rb_fb_orig_grp = nil
+            end
+
+            if rb_dynfov_enable:GetValue() then
+                local mn = rb_dynfov_min:GetValue()
+                local mx = rb_dynfov_max:GetValue()
+                if mn > mx then mn, mx = mx, mn end
+                local factor   = rb_dynfov_factor:GetValue()
+                local tick_min = math.max(1, math.floor(30 - factor * 0.09))
+                local tick_max = math.max(tick_min + 1, math.floor(60 - factor * 0.18))
+                if globals.TickCount() >= rb_fov_state.next_tick then
+                    -- math.random(a,b) entero: llega exactamente al maximo
+                    -- multiplicado x10 para preservar 1 decimal (ej: 55..90 → 5.5..9.0)
+                    local mn10 = math.floor(mn * 10 + 0.5)
+                    local mx10 = math.floor(mx * 10 + 0.5)
+                    rb_fov_state.current   = math.random(mn10, mx10) / 10
+                    rb_fov_state.next_tick = globals.TickCount() + math.random(tick_min, tick_max)
+                end
+                sv("rbot.fov", rb_fov_state.current)
+            end
+
+            sv("rbot.antirecoil",  rb_antirecoil:GetValue())
+            sv("rbot.recoil",      rb_antirecoil:GetValue())
+            sv("rbot.antispread",  rb_nospread:GetValue())
+            sv("rbot.spread",      rb_nospread:GetValue())
+            sv("rbot.doubletap",   rb_doubletap:GetValue())
+            sv("rbot.main.doubletap", rb_doubletap:GetValue())
+
+            if rb_dmg_feature:GetValue() then
+                for i, grp in ipairs(rb_wep_groups) do
+                    local v = (rb_override_en[i]:GetValue() and rb_override_val[i]:GetValue())
+                              or rb_mdmg[i]:GetValue()
+                    sv("rbot.hitscan.accuracy."..grp..".mindamage", v)
+                    sv("rbot.accuracy."..grp..".mindamage",         v)
+                    sv("rbot.weapon."..grp..".mindamage",           v)
+                end
+            end
+
+        end)
+
+            -- ── Anti-Aim ──
+            pcall(function()
+                local lp_pawn = entities.GetLocalPawn()
+                if not lp_pawn or not lp_pawn:IsAlive() then return end
+
+                -- Manual key tracking
+                local left_key  = aa_left :GetValue()
+                local right_key = aa_right:GetValue()
+                local fwd_key   = aa_fwd  :GetValue()
+                if (tonumber(left_key)  or 0) > 0 and input.IsButtonPressed(left_key)  then _aa_manual_state = (_aa_manual_state == 1) and 0 or 1 end
+                if (tonumber(right_key) or 0) > 0 and input.IsButtonPressed(right_key) then _aa_manual_state = (_aa_manual_state == 2) and 0 or 2 end
+                local fwd_active = ((tonumber(fwd_key) or 0) > 0 and input.IsButtonDown(fwd_key))
+                -- FWD activo: limpiar posición left/right para ir a backwards puro
+                if fwd_active then _aa_manual_state = 0 end
+
+                local aa_on        = test4_en:GetValue() and test4_cat:GetValue() == 1
+                -- FIX: AA Rage solo activo si Ragebot también está ON (previene bugs sin ragebot)
+                if aa_on then aa_on = rb_rage_enable:GetValue() end
+                local manual_active = (_aa_manual_state ~= 0)
+
+                -- Detectar transicion ON→OFF: desactivar nativo una sola vez al apagar
+                if _aa_was_on and not aa_on and not manual_active and not fwd_active then
+                    pcall(function() gui.SetValue("rbot.antiaim.enabled", false) end)
+                end
+                _aa_was_on = aa_on or manual_active or fwd_active
+
+                if not aa_on and not manual_active and not fwd_active then return end
+
+                -- Mientras AA Rage está activo: bloquear el nativo cada frame
+                if aa_on then
+                    sv("rbot.antiaim.enabled", false)
+                    pcall(function() gui.SetValue("rbot.antiaim.enabled", false) end)
+                end
+
+                -- FWD: forzar backwards sin tocar estado left/right
+                if fwd_active then
+                    sv("rbot.antiaim.yaw", 1)
+                    -- pitch y directions siguen del aa_enable
+                else
+                    local ym     = aa_yaw:GetValue()
+                    local preset = aa_yaw_preset:GetValue()
+                    if manual_active then
+                        sv("rbot.antiaim.yaw", 1)
+                    elseif preset ~= 0 or ym == 1 then
+                        -- Preset activo O Backwards: PreMove maneja el yaw; nativo Off
+                        sv("rbot.antiaim.yaw", 0)
+                    else
+                        sv("rbot.antiaim.yaw", 0)  -- Off siempre, PreMove controla
+                    end
+                end
+
+                -- Pitch y Directions: aplica si aa_on del script
+                if aa_on then
+                    local pitch_val = aa_pitch:GetValue()
+                    if pitch_val == 4 then
+                        sv("rbot.antiaim.pitch", (globals.TickCount() % 4 < 2) and 1 or 2)
+                    else
+                        sv("rbot.antiaim.pitch", pitch_val)
+                    end
+                end
+
+                -- Directions
+                if manual_active then
+                    sv("rbot.antiaim.autodir.targets", false)
+                    sv("rbot.antiaim.autodir.edges",   false)
+                elseif aa_on then
+                    sv("rbot.antiaim.autodir.targets", aa_dir_tgt:GetValue())
+                    sv("rbot.antiaim.autodir.edges", aa_dir_edges:GetValue() or aa_fs_en_main:GetValue())
+                end
+
+            end)
+    end)
+
+
+    -- ================================================================
+    -- TAB 0: VISUALS
+    -- ================================================================
+    local vis_left  = gui.Groupbox(win, "Local",    BORDER, CY, CW, WIN_H - CY - BORDER)
+    reg_group(0, vis_left)
+    local vis_right = gui.Groupbox(win, "Features", RIGHT_X, BORDER, CW, WIN_H - 2*BORDER)
+    reg_group(0, vis_right)
+
+    -- Custom Scope Lines
+    local function interpolate(s, e, p)
+        return math.floor(s + ((e - s) * p))
+    end
+    local function drawGradientLine(x, y, dx, dy, length, thickness, r1, g1, b1, a1, r2, g2, b2, a2, mode)
+        if length < 1 then return end   -- cubre length=0 y fracciones (<1 → steps=0 → div/0)
+        -- Cap a 60 pasos: 4 lineas × 60 = 240 draw calls/frame (antes 480)
+        local steps    = math.min(math.floor(length), 60)
+        local stepSize = length / steps  -- seguro: steps >= 1 porque length >= 1
+        for i = 0, steps - 1 do
+            local p = i / steps
+            if mode == 0 then p = 1 - p end
+            local r = interpolate(r1, r2, p)
+            local g = interpolate(g1, g2, p)
+            local b = interpolate(b1, b2, p)
+            local a = interpolate(a1, a2, p)
+            local curX  = x + dx * i * stepSize
+            local curY  = y + dy * i * stepSize
+            local nextX = x + dx * (i + 1) * stepSize
+            local nextY = y + dy * (i + 1) * stepSize
+            draw.Color(r, g, b, a)
+            if thickness <= 1 then
+                draw.Line(math.floor(curX), math.floor(curY), math.floor(nextX), math.floor(nextY))
+            else
+                local off = math.floor(thickness / 2)
+                if dx ~= 0 then
+                    draw.FilledRect(math.min(math.floor(curX), math.floor(nextX)), math.floor(curY) - off,
+                                    math.max(math.floor(curX), math.floor(nextX)), math.floor(curY) - off + thickness)
+                else
+                    draw.FilledRect(math.floor(curX) - off, math.min(math.floor(curY), math.floor(nextY)),
+                                    math.floor(curX) - off + thickness, math.max(math.floor(curY), math.floor(nextY)))
+                end
+            end
+        end
+    end
+    
+    local scope_master      = gui.Checkbox   (vis_left,      "fv2.scope.enable",      "Custom Scope Lines", false)
+    local scope_color_start = gui.ColorPicker(scope_master,  "fv2.scope.color_start", "",                   140, 151, 167, 255)
+    local scope_color_end   = gui.ColorPicker(scope_master,  "fv2.scope.color_end",   "",                   255, 255, 255, 255)
+    local scope_length = gui.Slider(vis_left, "fv2.scope.length", "  Length", 90, 0, 500, 1)
+    local scope_gap = gui.Slider(vis_left, "fv2.scope.gap", "  Center Gap", 19, 0, 50, 1)
+    local scope_type      = gui.Combobox(vis_left, "fv2.scope.type", "  Gradient Type", "Outside to Inside", "Inside to Outside")
+    local scope_hidevm    = gui.Checkbox(vis_left, "fv2.scope.hidevm",    "  Hide Viewmodel", false)
+    bind_master(scope_master, {scope_color_start, scope_color_end, scope_length, scope_gap, scope_type, scope_hidevm})
+
+
+
+
+    -- Viewmodel Changer (FOV + offsets)
+    local vm_master = gui.Checkbox(vis_left, "fv2.vm.enable", "Viewmodel", false)
+    local vm_fov    = gui.Slider  (vis_left, "fv2.vm.fov",    "  FOV",     68,   60,  74,  1)
+    local vm_x      = gui.Slider  (vis_left, "fv2.vm.x",      "  Offset X", 2.5, -2.5, 2.5, 0.5)
+    local vm_y      = gui.Slider  (vis_left, "fv2.vm.y",      "  Offset Y", 0,   -2, 2, 0.5)
+    local vm_z      = gui.Slider  (vis_left, "fv2.vm.z",      "  Offset Z", -1.5,-2, 2, 0.5)
+    vm_fov:SetInvisible(true)
+    vm_x  :SetInvisible(true)
+    vm_y  :SetInvisible(true)
+    vm_z  :SetInvisible(true)
+    bind_master(vm_master, {vm_fov, vm_x, vm_y, vm_z})
+
+
+    -- Viewmodel Changer function (solo FOV)
+    local vm_was_on   = false
+    local vm_orig_fov = tonumber(client.GetConVar("viewmodel_fov"))      or 68
+    local vm_orig_x   = tonumber(client.GetConVar("viewmodel_offset_x")) or 2.5
+    local vm_orig_y   = tonumber(client.GetConVar("viewmodel_offset_y")) or 0
+    local vm_orig_z   = tonumber(client.GetConVar("viewmodel_offset_z")) or -1.5
+    local function _viewmodelChanger()
+        if vm_master:GetValue() then
+            vm_was_on = true
+            local cur_fov = vm_fov:GetValue()
+            pcall(function() gui.SetValue("world.viewmodelfov", cur_fov) end)
+            client.SetConVar("viewmodel_fov",      cur_fov)
+            client.SetConVar("viewmodel_offset_x", vm_x:GetValue())
+            client.SetConVar("viewmodel_offset_y", vm_y:GetValue())
+            client.SetConVar("viewmodel_offset_z", vm_z:GetValue())
+        elseif vm_was_on then
+            vm_was_on = false
+            pcall(function() gui.SetValue("world.viewmodelfov", vm_orig_fov) end)
+            client.SetConVar("viewmodel_fov",      vm_orig_fov)
+            client.SetConVar("viewmodel_offset_x", vm_orig_x)
+            client.SetConVar("viewmodel_offset_y", vm_orig_y)
+            client.SetConVar("viewmodel_offset_z", vm_orig_z)
+        end
+    end
+
+
+
+    -- ── Watermark ──
+    pcall(function() _wm_font = draw.CreateFont("Calibri Bold", 13) end)
+    if not _wm_font then pcall(function() _wm_font = draw.CreateFont("Verdana", 13, 600) end) end
+
+    do
+        -- Orden idéntico :(+colors) → Multibox
+        local wm_master  = gui.Checkbox   (vis_right, "fv2.wm.enable",  "Watermark",   false)
+        -- Modern primero (índice 0) para que cargue en Modern por defecto
+        local wm_mode    = gui.Combobox   (vis_right, "fv2.wm.mode",    "Watermark UI","Glass", "Edge")
+        local wm_pos     = gui.Combobox   (vis_right, "fv2.wm.pos",     "Position",    "Right", "Left")
+        local wm_color   = gui.ColorPicker(wm_pos,    "fv2.wm.color",   "Watermark Color", 200, 200, 200, 255)
+        local wm_colorbg = gui.ColorPicker(wm_pos,    "fv2.wm.colorbg", "BG Color",         0,   0,   0,  221)
+        local wm_opt     = gui.Multibox   (vis_right, "Custom")
+        -- Orden: User, Uid, Build, FPS, Ping
+        local wm_user    = gui.Checkbox   (wm_opt,    "fv2.wm.user",  "User",  false)
+        local wm_uid     = gui.Checkbox   (wm_opt,    "fv2.wm.uid",   "Uid",   true)
+        local wm_build   = gui.Checkbox   (wm_opt,    "fv2.wm.build", "Build", true)
+        local wm_fps     = gui.Checkbox   (wm_opt,    "fv2.wm.fps",   "FPS",   false)
+        local wm_ping    = gui.Checkbox   (wm_opt,    "fv2.wm.ping",  "Ping",  false)
+
+        wm_mode:SetInvisible(true)
+        wm_pos :SetInvisible(true)
+        wm_opt :SetInvisible(true)
+        bind_master(wm_master, { wm_mode, wm_pos, wm_opt })
+
+        -- OPT: FPS con promedio móvil de 60 muestras (~1s) → número estable y legible
+        local _wm_frame       = 0
+        local _wm_cached_fps  = 0
+        local _wm_cached_ping     = 0
+        local _wm_ping_interval   = 1.0  -- segundos entre updates del ping
+        -- FPS: avg sobre últimas 60 muestras, display actualizado cada 1s (RealTime)
+        local _fps_samples   = {}
+        local _fps_MAX       = 60
+        local _fps_interval  = 1.0  -- segundos entre updates del display
+        -- Expuestos al scope externo para poder resetearlos en round_start
+        _G._fv2_fps_last_time  = 0
+        _G._fv2_ping_last_time = 0
+        callbacks.Register("Draw", "fv2_wm_cache", function()
+            _wm_active = wm_master:GetValue()
+            if not _wm_active then return end
+
+            -- Acumular muestra cada frame (igual que la imagen)
+            pcall(function()
+                local ft = globals.FrameTime()
+                if ft and ft > 0 then
+                    local current_fps = math.floor(1 / ft)
+                    table.insert(_fps_samples, current_fps)
+                    if #_fps_samples > _fps_MAX then
+                        table.remove(_fps_samples, 1)
+                    end
+                end
+            end)
+            -- Actualizar display cada _fps_interval segundos (RealTime, no frames)
+            pcall(function()
+                local now = globals.RealTime()
+                if now - (_G._fv2_fps_last_time or 0) >= _fps_interval then
+                    _G._fv2_fps_last_time = now
+                    if #_fps_samples > 0 then
+                        local sum = 0
+                        for _, v in ipairs(_fps_samples) do sum = sum + v end
+                        _wm_cached_fps = math.floor(sum / #_fps_samples)
+                    end
+                end
+            end)
+            -- Ping: cada 1s usando RealTime (igual que FPS)
+            pcall(function()
+                local now = globals.RealTime()
+                if now - (_G._fv2_ping_last_time or 0) >= _wm_ping_interval then
+                    _G._fv2_ping_last_time = now
+                    local info = client.GetPlayerInfo(client.GetLocalPlayerIndex())
+                    if info and info.ping then _wm_cached_ping = info.ping end
+                end
+            end)
+            -- Resto del cache: cada 20 frames
+            _wm_frame = _wm_frame + 1
+            if _wm_frame < 20 then return end
+            _wm_frame = 0
+            pcall(function()
+                _wm_style = wm_mode:GetValue()
+                _wm_pos   = wm_pos:GetValue()
+                local parts = {"fantasy"}
+                if wm_user :GetValue() then parts[#parts+1] = _cur_user.name           end
+                if wm_uid  :GetValue() then parts[#parts+1] = "uid: " .. _cur_user.uid end
+                if wm_build:GetValue() then parts[#parts+1] = "beta"                   end
+                if wm_fps  :GetValue() then parts[#parts+1] = _wm_cached_fps .. " fps" end
+                if wm_ping :GetValue() then parts[#parts+1] = _wm_cached_ping .. " ms" end
+                _wm_text = table.concat(parts, " | ")
+                local r1,g1,b1,a1 = wm_color  :GetValue()
+                _wm_accent[1],_wm_accent[2],_wm_accent[3],_wm_accent[4] = r1,g1,b1,a1
+                local r2,g2,b2,a2 = wm_colorbg:GetValue()
+                _wm_bg[1],_wm_bg[2],_wm_bg[3],_wm_bg[4] = r2,g2,b2,a2
+            end)
+        end)
+    end
+
+    local ind_master      = gui.Checkbox   (vis_right,  "fv2.ind.enable",    "Indicators",  false)
+    -- Dos ColorPickers: uno por panel. Solo se muestra el del panel activo en el menú.
+    local ind_color_side  = gui.ColorPicker(ind_master, "fv2.ind.color",      "",            132, 196, 20,  245)  -- verde original
+    local ind_color_xhair = gui.ColorPicker(ind_master, "fv2.ind.xh.color",   "",            255, 255, 255, 245)  -- blanco (crosshair)
+    local ind_off_en      = { side  = gui.Checkbox(vis_right, "fv2.ind.off.en.side",  "  Offset", false),
+                               xhair = gui.Checkbox(vis_right, "fv2.ind.off.en.xhair", "  Offset", false) }
+    local ind_xhair_gap   = gui.Slider     (vis_right,  "fv2.ind.xhair.gap",    "    Size",    12, 9, 15, 1)
+    -- Offset Side
+    local ind_off_x_side  = gui.Slider     (vis_right,  "fv2.ind.offx.side",    "    X",       0,  -12,  1809, 1)
+    local ind_off_y_side  = gui.Slider     (vis_right,  "fv2.ind.offy.side",    "    Y",       0, -457,   327, 1)
+    local ind_off_reset_s = gui.Checkbox   (vis_right,  "fv2.ind.reset.side",   "    Reset",   false)
+    -- Offset Crosshair
+    local ind_off_y_xhair = gui.Slider     (vis_right,  "fv2.ind.offy.xhair",   "    Y",       0, -441,   327, 1)
+    local ind_off_reset_x = gui.Checkbox   (vis_right,  "fv2.ind.reset.xhair",  "    Reset",   false)
+    -- Panel Side
+    local ind_multi_side  = gui.Multibox(vis_right, "  Side")
+    local ind_side = {
+        trg      = gui.Checkbox(ind_multi_side, "fv2.ind.s.trg",      "TM",         false),
+        aw       = gui.Checkbox(ind_multi_side, "fv2.ind.s.aw",       "AW Legit",   false),
+        baim     = gui.Checkbox(ind_multi_side, "fv2.ind.s.baim",     "Baim Legit", false),
+        trigger  = gui.Checkbox(ind_multi_side, "fv2.ind.s.trigger",  "Autofire",   false),
+        rage     = gui.Checkbox(ind_multi_side, "fv2.ind.s.rage",     "RAGE",       false),
+        fov      = gui.Checkbox(ind_multi_side, "fv2.ind.s.fov",      "FOV",        false),
+        dmgnum   = gui.Checkbox(ind_multi_side, "fv2.ind.s.dmg",      "Damage",     false),
+        awrage   = gui.Checkbox(ind_multi_side, "fv2.ind.s.awrage",   "AW Rage",    false),
+        fs       = gui.Checkbox(ind_multi_side, "fv2.ind.s.fs",       "Freestand",  false),
+        dt       = gui.Checkbox(ind_multi_side, "fv2.ind.s.dt",       "Doubletap",  false),
+        baimrage = gui.Checkbox(ind_multi_side, "fv2.ind.s.baimrage", "Baim Rage",  false),
+        qswitch  = gui.Checkbox(ind_multi_side, "fv2.ind.s.qswitch",  "QSwitch",    false),
+        nospread = gui.Checkbox(ind_multi_side, "fv2.ind.s.nospread", "Nospread",   false),
+        ovr      = gui.Checkbox(ind_multi_side, "fv2.ind.s.ovr",      "DMG",        false),
+    }
+
+    -- Panel Crosshair
+    local ind_multi_xhair = gui.Multibox(vis_right, "  Crosshair")
+    local ind_xhair_tab = {
+        trg      = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.trg",      "TM",         false),
+        aw       = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.aw",       "AW Legit",   false),
+        baim     = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.baim",     "Baim Legit", false),
+        trigger  = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.trigger",  "Autofire",   false),
+        rage     = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.rage",     "RAGE",       false),
+        fov      = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.fov",      "FOV",        false),
+        dmgnum   = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.dmg",      "Damage",     false),
+        awrage   = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.awrage",   "AW Rage",    false),
+        fs       = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.fs",       "Freestand",  false),
+        dt       = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.dt",       "Doubletap",  false),
+        baimrage = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.baimrage", "Baim Rage",  false),
+        qswitch  = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.qswitch",  "QSwitch",    false),
+        nospread = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.nospread", "Nospread",   false),
+        ovr      = gui.Checkbox(ind_multi_xhair, "fv2.ind.xh.ovr",      "DMG",        false),
+    }
+    -- Group: debajo de ambos paneles
+    local ind_font_sel    = gui.Combobox   (vis_right,  "fv2.ind.font",       "  Group",     "Side", "Crosshair")
+
+    -- Ventana flotante para modo Separate
+    local _flat_order = {
+        { k="trg",      label="TM"         },
+        { k="aw",       label="AW Legit"   },
+        { k="baim",     label="Baim Legit" },
+        { k="trigger",  label="Autofire"   },
+        { k="rage",     label="RAGE"       },
+        { k="fov",      label="FOV"        },
+        { k="dmgnum",   label="Damage"     },
+        { k="awrage",   label="AW Rage"    },
+        { k="fs",       label="Freestand"  },
+        { k="dt",       label="Doubletap"  },
+        { k="baimrage", label="Baim Rage"  },
+        { k="qswitch",  label="QSwitch"    },
+        { k="nospread", label="Nospread"   },
+        { k="ovr",      label="DMG"        },
+    }
+    local _SEP_ROW  = 24
+    local _SEP_H    = 20 + #_flat_order * _SEP_ROW + 76
+    local _SEP_W    = 160
+    local _sep_x    = math.floor(init_sw / 3) + WIN_W + 5
+    local _sep_y    = math.floor(init_sh / 3)
+    local sep_win_s = gui.Window("fv2_sep_side",  "Side Colors",      _sep_x, _sep_y, _SEP_W, _SEP_H)
+    local sep_win_x = gui.Window("fv2_sep_xhair", "Crosshair Colors", _sep_x, _sep_y, _SEP_W, _SEP_H)
+    local sep_box_s = gui.Groupbox(sep_win_s, "", 0, 0, _SEP_W, _SEP_H)
+    local sep_box_x = gui.Groupbox(sep_win_x, "", 0, 0, _SEP_W, _SEP_H)
+    local ind_side_col  = {}
+    local ind_xhair_col = {}
+    local ind_sep_side  = {}   -- cb_s: checkboxes del sep_win Side (usados cuando split ON)
+    local ind_sep_xhair = {}   -- cb_x: checkboxes del sep_win Crosshair
+    for _, entry in ipairs(_flat_order) do
+        local k, lbl = entry.k, entry.label
+        local cb_s = gui.Checkbox(sep_box_s, "fv2.ind.sf."..k,  lbl, false)
+        ind_side_col[k]  = gui.ColorPicker(cb_s, "fv2.ind.s."..k..".col",  "", 132, 196, 20,  245)
+        ind_sep_side[k]  = cb_s
+        local cb_x = gui.Checkbox(sep_box_x, "fv2.ind.xhf."..k, lbl, false)
+        ind_xhair_col[k] = gui.ColorPicker(cb_x, "fv2.ind.xh."..k..".col", "", 255, 255, 255, 245)
+        ind_sep_xhair[k] = cb_x
+    end
+    -- Side Colors: Damage y NS arrancan en blanco
+    pcall(function() ind_side_col["dmgnum"]  :SetValue(255, 255, 255, 245) end)
+    pcall(function() ind_side_col["nospread"]:SetValue(255, 255, 255, 245) end)
+    sep_win_s:SetInvisible(true)
+    sep_win_x:SetInvisible(true)
+    -- Estado inicial: todo oculto hasta que ind_master se active
+    ind_off_en.side :SetInvisible(true)
+    ind_off_en.xhair:SetInvisible(true)
+    ind_xhair_gap   :SetInvisible(true)
+    ind_off_x_side  :SetInvisible(true)
+    ind_off_y_side  :SetInvisible(true)
+    ind_off_reset_s :SetInvisible(true)
+    ind_off_y_xhair :SetInvisible(true)
+    ind_off_reset_x :SetInvisible(true)
+    ind_font_sel    :SetInvisible(true)
+    ind_multi_side  :SetInvisible(true)
+    ind_multi_xhair :SetInvisible(true)
+    ind_color_xhair :SetInvisible(true)  -- verde visible por default (group=Side)
+
+    local ind_dmg_update  = gui.Checkbox(vis_right, "fv2.ind.dmgupdate",  "  DMG Sync",    false)
+    local ind_clean_scope = gui.Checkbox(vis_right, "fv2.ind.cleanscope", "  Ghost Scope", false)
+    local ind_split_s     = gui.Checkbox(vis_right, "fv2.ind.split.s",  "  Custom Side",      false)
+    local ind_split_x     = gui.Checkbox(vis_right, "fv2.ind.split.x",  "  Custom Crosshair", false)
+    ind_dmg_update :SetInvisible(true)
+    ind_clean_scope:SetInvisible(true)
+    ind_split_s    :SetInvisible(true)
+    ind_split_x    :SetInvisible(true)
+
+    -- bind_master solo activa/desactiva los elementos que SIEMPRE se muestran con el master.
+    -- Los que dependen del grupo (multiboxes y color pickers) los maneja fv2_font_update.
+    bind_master(ind_master, { ind_font_sel, ind_dmg_update, ind_clean_scope })
+
+    callbacks.Register("Draw", "fv2_font_update", function()
+        pcall(function()
+            _xhair_sel      = ind_font_sel:GetValue()  -- 0=Side, 1=Crosshair
+            _xhair_size_val = ind_xhair_gap:GetValue()
+            local master_on    = ind_master:GetValue()
+            local view_xhair   = (_xhair_sel == 1)
+            local off_on_side  = master_on and ind_off_en.side:GetValue()
+            local off_on_xhair = master_on and ind_off_en.xhair:GetValue()
+
+            -- Cada checkbox de Offset solo se muestra en su grupo
+            ind_off_en.side :SetInvisible(not (master_on and not view_xhair))
+            ind_off_en.xhair:SetInvisible(not (master_on and     view_xhair))
+            ind_font_sel:SetInvisible(not master_on)
+
+            -- Split / Per Color
+            local split_s  = master_on and ind_split_s:GetValue()
+            local split_x  = master_on and ind_split_x:GetValue()
+            local split_on = view_xhair and split_x or (not view_xhair and split_s)
+            -- Cada checkbox solo visible en su grupo
+            ind_split_s:SetInvisible(not (master_on and not view_xhair))
+            ind_split_x:SetInvisible(not (master_on and     view_xhair))
+            -- Color global: solo si split del grupo activo está desactivado
+            ind_color_side :SetInvisible(not (master_on and not view_xhair and not split_s))
+            ind_color_xhair:SetInvisible(not (master_on and     view_xhair and not split_x))
+            -- Ventanas flotantes: solo en tab Visual (0), y según split activo
+            local menu_open_sep = false
+            pcall(function() local m=gui.Reference("Menu"); if m then menu_open_sep=m:IsActive() end end)
+            local _on_visual = (tab_sel:GetValue() == 0)
+            local _ss_on = menu_open_sep and _on_visual and split_s and not view_xhair
+            local _sx_on = menu_open_sep and _on_visual and split_x and     view_xhair
+            sep_win_s:SetInvisible(not _ss_on)
+            sep_win_x:SetInvisible(not _sx_on)
+            pcall(function() sep_win_s:SetActive(_ss_on) end)
+            pcall(function() sep_win_x:SetActive(_sx_on) end)
+
+            -- Multiboxes: ocultar si split del grupo activo está activado
+            ind_multi_side :SetInvisible(not (master_on and not view_xhair and not split_s))
+            ind_multi_xhair:SetInvisible(not (master_on and     view_xhair and not split_x))
+
+            -- Offset: Side tiene X+Y+Reset, Crosshair tiene Y+Reset+Gap (independientes)
+            ind_off_x_side  :SetInvisible(not (off_on_side  and not view_xhair))
+            ind_off_y_side  :SetInvisible(not (off_on_side  and not view_xhair))
+            ind_off_reset_s :SetInvisible(not (off_on_side  and not view_xhair))
+            ind_off_y_xhair :SetInvisible(not (off_on_xhair and     view_xhair))
+            ind_off_reset_x :SetInvisible(not (off_on_xhair and     view_xhair))
+            ind_xhair_gap   :SetInvisible(not (off_on_xhair and     view_xhair))
+
+            ind_dmg_update :SetInvisible(not master_on)
+            ind_clean_scope:SetInvisible(not master_on)
+        end)
+    end)
+    bind_master(ind_off_en.side,  {})
+    bind_master(ind_off_en.xhair, {})
+
+
+    -- ================================================================
+    -- TAB 1: MISC
+    -- ================================================================
+    local qs_box    = gui.Groupbox(win, "Switch", BORDER, CY, CW, WIN_H - CY - BORDER)
+    reg_group(1, qs_box)
+    local EXTRAS_H  = 90
+    local misc_opts = gui.Groupbox(win, "Extras",      RIGHT_X, BORDER,  CW, EXTRAS_H)
+    reg_group(1, misc_opts)
+    local QS_Y      = BORDER + EXTRAS_H + BORDER
+    local misc_box  = gui.Groupbox(win, "Movement",        RIGHT_X, QS_Y, CW, WIN_H - QS_Y - BORDER)
+    reg_group(1, misc_box)
+
+    local js_master = gui.Checkbox(misc_box, "fv2.js.enable", "Jumpscout", false)
+    local fg_master
+
+    pcall(function()
+        as_orig_hc = gui.GetValue("misc.movement.autostrafe.hitchance")
+        if as_orig_hc == nil then as_orig_hc = gui.GetValue("misc.autostrafe.hitchance") end
+    end)
+
+    local as_better         = gui.Checkbox(misc_box, "fv2.as.better", "Better Autostrafe", false)
+    local autostrafe_master = gui.Checkbox(misc_box, "fv2.as.enable", "Autostrafe HC AW",  false)
+    local autostrafe_hc     = gui.Slider  (misc_box, "fv2.as.hc",     "  Hitchance",       50, 0, 100, 1)
+    autostrafe_hc:SetInvisible(true)
+    bind_master(autostrafe_master, { autostrafe_hc })
+
+    local peek_master     = gui.Checkbox   (misc_box, "fv2.peek.enable",    "Autopeek",         false)
+    local peek_circ_col   = gui.ColorPicker(peek_master, "fv2.peek.circcol", "",                249, 194, 193, 255)
+    local peek_ret_col    = gui.ColorPicker(peek_master, "fv2.peek.retcol",  "",                179, 174, 237, 255)
+    local peek_ret_fire   = gui.Checkbox   (misc_box, "fv2.peek.retfire",   "  Return on Fire", false)
+    local peek_jump_back  = gui.Checkbox   (misc_box, "fv2.peek.jumpback",  "  Jump on Return", false)
+    peek_style      = gui.Combobox   (misc_box, "fv2.peek.style",     "  Style",
+        "Basic",     -- 0
+        "Void",      -- 1
+        "Radial",    -- 2
+        "Orbit",     -- 3
+        "Pulse",     -- 4
+        "Wave",      -- 5
+        "Solar",     -- 6
+        "Prism"      -- 7
+    )
+    peek_style_col  = nil
+    peek_ret_fire :SetInvisible(true)
+    peek_jump_back:SetInvisible(true)
+    peek_style    :SetInvisible(true)
+    bind_master(peek_master, { peek_circ_col, peek_ret_col, peek_ret_fire, peek_jump_back, peek_style })
+
+    -- ================================================================
+    -- CLANTAG
+    -- ================================================================
+    -- FFI: unlock nFlags del ConVar "name"
+    xpcall(function()
+        local ffi2 = ffi
+        if not pcall(ffi2.sizeof, "struct IEngineCvar_CT") then
+            ffi2.cdef [[
+                typedef struct CConVar_CT {
+                    const char* szName;
+                    struct CConVar_CT* pNext;
+                    char pad_01[0x10];
+                    const char* szDescription;
+                    uint32_t nType;
+                    uint32_t nRegistered;
+                    uint32_t nFlags;
+                    uint32_t m_unk3;
+                    uint32_t m_nCallbacks;
+                    uint32_t m_unk4;
+                    union {
+                        bool        Bool;
+                        int         Int;
+                        float       Float;
+                        const char* String;
+                    } Value;
+                } CConVar_CT;
+                typedef struct CUtlLinkedListElement_CT {
+                    struct CConVar_CT* element;
+                    uint16_t iPrevious;
+                    uint16_t iNext;
+                } CUtlLinkedListElement_CT;
+                typedef struct IEngineCvar_CT {
+                    char pad_01[0x40];
+                    uint64_t unk_pad;
+                    struct CUtlLinkedListElement_CT* pMemory;
+                    uint16_t iHead;
+                    uint16_t iTail;
+                    uint16_t iFirstFree;
+                    uint16_t nElementCount;
+                    uint16_t nAllocated;
+                } IEngineCvar_CT;
+                void* GetProcAddress(uintptr_t, const char*);
+                typedef void*(*fnCreateInterface_CT)(const char*, void*);
+            ]]
+        end
+        local tier0 = mem.GetModuleBase("tier0.dll")
+        local ci = ffi2.cast("fnCreateInterface_CT", ffi2.C.GetProcAddress(tier0, "CreateInterface"))
+        local ICvar = ffi2.cast("struct IEngineCvar_CT*", ci("VEngineCvar007", nil))
+        if ICvar == nil then return end
+        local data = ICvar.pMemory
+        for i = 0, ICvar.nAllocated - 1 do
+            local node = data[i]
+            local cvar = node.element
+            if cvar ~= nil and cvar.szName ~= nil then
+                if ffi2.string(cvar.szName) == "name" then
+                    cvar.nFlags = 33408
+                    _G.__ct_ffi_cvar = cvar
+                    _G.__ct_ffi_ok   = true
+                    break
+                end
+            end
+        end
+    end, function(msg) print("[clantag] FFI error: " .. tostring(msg)) end)
+
+    -- Detectar nombre del jugador
+    local function ct_get_player_name()
+        if _G.__ct_original_name and _G.__ct_original_name ~= "" then
+            return _G.__ct_original_name
+        end
+        local ok, r = pcall(function()
+            local idx  = client.GetLocalPlayerIndex()
+            local info = client.GetPlayerInfo(idx)
+            return (info and info.name and info.name ~= "") and info.name or nil
+        end)
+        if ok and r then _G.__ct_original_name = r end
+        return (ok and r) or ""
+    end
+
+    -- Intentar capturar nombre al init
+    pcall(function()
+        _G.__ct_original_name = nil
+        if _G.__ct_ffi_ok and _G.__ct_ffi_cvar then
+            local ptr = _G.__ct_ffi_cvar.Value.String
+            if ptr ~= nil then
+                local s = ffi.string(ptr)
+                if s and s ~= "" then _G.__ct_original_name = s end
+            end
+        end
+        if not _G.__ct_original_name then
+            local idx  = client.GetLocalPlayerIndex()
+            local info = client.GetPlayerInfo(idx)
+            if info and info.name and info.name ~= "" then
+                _G.__ct_original_name = info.name
+            end
+        end
+    end)
+
+    -- Construir tabla de frames
+    for _, tag in ipairs(CT_TAGS) do
+        for _ = 1, CT_PAUSE do
+            _ct_frames[#_ct_frames + 1] = tag
+        end
+    end
+
+    -- Setear nombre en juego
+    local function ct_set_name(tag)
+        local pname = ct_get_player_name()
+        local full  = (pname ~= "") and (tag .. CT_NAME_SEP .. pname) or tag
+        if full == "" then full = " " end
+        pcall(function()
+            if _G.__ct_ffi_ok and _G.__ct_ffi_cvar then
+                _G.__ct_ffi_cvar.nFlags = 33408
+            end
+        end)
+        pcall(function() client.Command('setinfo name "' .. full .. '"', true) end)
+    end
+
+    local ct_enable = gui.Checkbox(misc_opts, "fv2.ct.enable", "Clantag", false)
+
+    -- OPT: cachear latencia clantag, GetPlayerInfo cada 30 frames en vez de cada frame
+    local _ct_cached_latency = 0
+    local _ct_lat_frame      = 0
+    callbacks.Register("Draw", "fv2_ctanim_draw", function()
+        pcall(function()
+            if #_ct_frames == 0 then return end
+            if ct_enable:GetValue() then
+                pcall(function()
+                    if _G.__ct_ffi_ok and _G.__ct_ffi_cvar then
+                        _G.__ct_ffi_cvar.nFlags = 33408
+                    end
+                end)
+                _ct_lat_frame = _ct_lat_frame + 1
+                if _ct_lat_frame >= 30 then
+                    _ct_lat_frame = 0
+                    pcall(function()
+                        local info = client.GetPlayerInfo(client.GetLocalPlayerIndex())
+                        if info and info.ping then _ct_cached_latency = info.ping / 1000 end
+                    end)
+                end
+                local latency = _ct_cached_latency
+                local server_time = math.floor((globals.CurTime() - latency) / CT_ANIM_STEP)
+                _ct_frame_idx = (server_time % #_ct_frames) + 1
+                local new_tag = _ct_frames[_ct_frame_idx]
+                if new_tag ~= _ct_last then
+                    ct_set_name(new_tag)
+                    pcall(function() client.SetClantag(new_tag) end)
+                    _ct_last = new_tag
+                end
+            elseif _ct_last ~= "" then
+                local orig = _G.__ct_original_name or ""
+                pcall(function()
+                    if _G.__ct_ffi_ok and _G.__ct_ffi_cvar then
+                        _G.__ct_ffi_cvar.nFlags = 33408
+                    end
+                end)
+                pcall(function()
+                    client.Command('setinfo name "' .. (orig ~= "" and orig or " ") .. '"', true)
+                end)
+                pcall(function() client.SetClantag("") end)
+                _ct_last      = ""
+                _ct_frame_idx = 1
+            end
+        end)
+    end)
+    -- ================================================================
+
+    fg_master        = gui.Checkbox(misc_opts, "fv2.fg.enable",  "Fast Grenade",     false)
+
+    local qs_master    = gui.Checkbox(qs_box, "fv2.qs.enable", "Quickswitch", false)
+    local qs_delay     = gui.Slider  (qs_box, "fv2.qs.delay",  "  Delay ms",  30, 15, 150, 1)
+    local qs_wep_multi = gui.Multibox(qs_box, "  Weapon")
+    local qs_ssg    = gui.Checkbox(qs_wep_multi, "fv2.qs.ssg",    "SSG 08", false)
+    local qs_awp    = gui.Checkbox(qs_wep_multi, "fv2.qs.awp",    "AWP",    false)
+    local qs_deagle = gui.Checkbox(qs_wep_multi, "fv2.qs.deagle", "Desert", false)
+    qs_delay    :SetInvisible(true)
+    qs_wep_multi:SetInvisible(true)
+    bind_master(qs_master, { qs_delay, qs_wep_multi })
+
+    local function qs_weapon_active(wname)
+        local n = wname:gsub("weapon_", "")
+        if n == "ssg08"  then return qs_ssg   :GetValue() end
+        if n == "awp"    then return qs_awp   :GetValue() end
+        if n == "deagle" then return qs_deagle:GetValue() end
+        return false
+    end
+    -- FIX #3: client.Command(..., true) dentro de FireGameEvent causa re-entrancia
+    -- que crashea a nivel C++ (el pcall de Lua no lo atrapa).
+    -- Solución: guardar el comando pendiente y ejecutarlo en fv2_draw (Draw callback).
+    local function as_rage_strafer(cmd, vel)
+        pcall(function()
+            local spd = vel:Length2D(); if spd < 5 then return end
+            local aa = tonumber(client.GetConVar("sv_airaccelerate")) or 10
+            local term = 30.0 / aa / 300 * 100.0 / spd
+            local delta_air = (term < 1.0 and term > -1.0) and math.acos(term) or 0.0
+            local ang = engine.GetViewAngles(); ang.z = 0
+            local vel_ang = math.atan2(vel.y, vel.x) - math.rad(ang.y)
+            local best    = math.atan2(cmd:GetSideMove(), cmd:GetForwardMove())
+            local d = vel_ang - best
+            d = math.fmod(d, math.pi * 2)
+            if vel_ang > best then if d >= math.pi  then d = d - math.pi*2 end
+            else                   if d <= -math.pi then d = d + math.pi*2 end end
+            local final = d < 0.0 and vel_ang + delta_air or vel_ang - delta_air
+            cmd:SetForwardMove(math.cos(final))
+            cmd:SetSideMove(math.sin(final))
+        end)
+    end
+
+
+
+
+    -- ── Peek state ───────────────────────────────────────────────────
+    local function _pk_reset() _pk_peeking=false; _pk_start_pos=nil; _pk_returning=false end
+    callbacks.Register("AimbotTarget","fv2_pk_tgt",function(ent) _pk_has_target=(ent~=nil) end)
+    -- ─────────────────────────────────────────────────────────────────
+
+    -- FIX #2: entities.GetByIndex puede tirar excepcion C++ con userid inválido en CS2.
+    -- Envolver TODO en pcall para que el crash no propague al host.
+    local function fg_userid_to_idx(userid)
+        local ok, result = pcall(function()
+            local pc = entities.GetByIndex(userid + 1)
+            if not pc then return nil end
+            local pawn = nil
+            pcall(function() pawn = pc:GetFieldEntity("m_hPawn") end)
+            if not pawn then return nil end
+            return pawn:GetIndex()
+        end)
+        return (ok and result) or nil
+    end
+
+    callbacks.Register("CreateMove","fv2_createmove",function(cmd)
+        if as_better:GetValue() then
+            pcall(function()
+                local lp = entities.GetLocalPawn(); if not lp then return end
+                if not lp:IsAlive() then return end
+                local movetype = lp:GetPropInt("m_MoveType") or 0
+                local flags    = lp:GetPropInt("m_fFlags")   or 0
+                if movetype == AS_MOVETYPE.LADDER or movetype == AS_MOVETYPE.NOCLIP
+                   or bit.band(flags, AS_FLAGS.ONGROUND) ~= 0 then return end
+                if not cmd then return end
+                if bit.band(cmd:GetButtons(), AS_BUTTONS.IN_SPEED) ~= 0 then return end
+                local vel = lp:GetPropVector("m_vecVelocity")
+                if not vel then return end
+                as_rage_strafer(cmd, vel)
+            end)
+        end
+
+        if js_master:GetValue() then
+            pcall(function()
+                if not cmd then return end
+                local lp = entities.GetLocalPawn(); if not lp then return end
+                if not lp:IsAlive() then return end
+                local flags     = lp:GetPropInt("m_fFlags") or 0
+                local on_ground = bit.band(flags, 1) ~= 0
+                local attacking = bit.band(cmd:GetButtons(), 1) ~= 0
+                if on_ground and attacking then
+                    local vel = lp:GetPropVector("m_vecVelocity")
+                    if vel and vel:Length2D() > 8 then
+                        cmd:SetForwardMove(0)
+                        cmd:SetSideMove(0)
+                    end
+                end
+            end)
+        end
+
+        pcall(function() _viewmodelChanger() end)
+
+        -- ── Peek ─────────────────────────────────────────────────────
+        pcall(function()
+            if not cmd then return end
+            local lp = entities.GetLocalPawn()
+            if not lp or not lp:IsAlive() then _pk_reset(); return end
+
+            if peek_master:GetValue() then
+                if not _pk_peeking then
+                    _pk_start_pos = lp:GetAbsOrigin()
+                    _pk_peeking   = true
+                    _pk_returning = false
+                end
+            else
+                if _pk_peeking then _pk_reset() end
+                return
+            end
+
+            if _pk_returning and _pk_start_pos then
+                local cur  = lp:GetAbsOrigin()
+                local dx   = _pk_start_pos.x - cur.x
+                local dy   = _pk_start_pos.y - cur.y
+                local dist = math.sqrt(dx*dx + dy*dy)
+                if dist < 10.0 then
+                    _pk_returning = false
+                    cmd:SetForwardMove(0); cmd:SetSideMove(0)
+                else
+                    local yaw_to_start = math.atan2(dy, dx)
+                    local va           = engine.GetViewAngles()
+                    local view_yaw     = math.rad(va.yaw)
+                    local yaw_delta    = view_yaw - yaw_to_start
+                    cmd:SetForwardMove( math.cos(yaw_delta) * 1.0)
+                    cmd:SetSideMove   (-math.sin(yaw_delta) * 1.0)
+                    local b = cmd:GetButtons()
+                    b = bit.band(b, bit.bnot(8));   b = bit.band(b, bit.bnot(16))
+                    b = bit.band(b, bit.bnot(512));  b = bit.band(b, bit.bnot(1024))
+                    if peek_jump_back:GetValue() then b = bit.bor(b, 2) end
+                    cmd:SetButtons(b)
+                end
+            end
+        end)
+        -- ─────────────────────────────────────────────────────────────
+
+        -- Hide viewmodel when scoped (scope_hidevm opcional)
+        pcall(function()
+            local hidevm_on = scope_master:GetValue() and scope_hidevm:GetValue()
+            if hidevm_on then
+                local lp = entities.GetLocalPawn()
+                if lp and lp:IsAlive() then
+                    if lp:GetFieldBool("m_bIsScoped") then
+                        client.SetConVar("r_drawviewmodel", "0", true)
+                    else
+                        client.SetConVar("r_drawviewmodel", "1", true)
+                    end
+                end
+            else
+                -- restaurar al desactivar el checkbox o el master
+                if _hidevm_was_on then
+                    client.SetConVar("r_drawviewmodel", "1", true)
+                end
+            end
+            _hidevm_was_on = hidevm_on
+        end)
+
+    end)
+
+    -- Manual AA en PreMove (igual que frog): corre ANTES del autostrafe nativo
+    -- del cheat, evitando la desincronización yaw/movimiento que causaba stutter.
+    callbacks.Register("PreMove", "fv2_aa_premove", function(cmd)
+        pcall(function()
+            if not cmd then return end
+            local lp_pawn = entities.GetLocalPawn()
+            if not lp_pawn or not lp_pawn:IsAlive() then return end
+
+            local angle = cmd:GetViewAngles()
+            if not angle then return end
+
+            local ext = _G._fv2_aa_ext
+
+            local aa_on         = test4_en:GetValue() and test4_cat:GetValue() == 1
+            local manual_active = (_aa_manual_state ~= 0)
+            local fwd_key_pm    = aa_fwd:GetValue()
+            local fwd_active_pm = ((tonumber(fwd_key_pm) or 0) > 0 and input.IsButtonDown(fwd_key_pm))
+            -- FIX: fwd_active tambien activa el PreMove AA
+            if not aa_on and not manual_active and not fwd_active_pm then return end
+
+            -- Skip on ladder or grenade
+            local movetype = 0
+            pcall(function()
+                movetype = lp_pawn:GetPropInt("m_nActualMoveType")
+                         or lp_pawn:GetFieldInt("m_nActualMoveType") or 0
+            end)
+            if movetype == 9 then return end
+
+            local weaponType = -1
+            pcall(function() weaponType = lp_pawn:GetWeaponType() end)
+
+            -- Disable Conditions
+            local dc = _G._fv2_aa_dc
+            if dc then
+                local is_grenade = (weaponType == 9 or weaponType == 17 or weaponType == 15
+                                    or weaponType == 14 or weaponType == 16)
+                local is_knife   = (weaponType == 0)
+                if dc.ongren:GetValue()  and is_grenade then return end
+                if dc.onknife:GetValue() and is_knife   then return end
+                if dc.onkey:GetValue() then
+                    local kb = dc.keybox:GetValue()
+                    if (tonumber(kb) or 0) > 0 and input.IsButtonDown(kb) then return end
+                end
+            end
+
+            -- No AA on Shot removido del GUI (desactivado)
+
+            local tick   = globals.TickCount()
+            local base_y = angle.y
+            local ym     = aa_yaw:GetValue()
+            local pm     = aa_pitch:GetValue()
+            local preset = aa_yaw_preset:GetValue()
+
+            -- At Targets rota la base 180° para que los offsets apunten hacia el enemigo.
+            -- Backwards (ym==1) en estado neutro suma otros 180° sobre base_y RAW (no sobre base_y ya rotado).
+            -- Se guarda base_y_raw antes del ajuste de At Targets para que Backwards
+            -- funcione correctamente con o sin At Targets activado.
+            local base_y_raw = base_y
+            if aa_dir_tgt:GetValue() then
+                base_y = base_y + 180
+            end
+
+            -- Helper: aplica el preset seleccionado al ángulo.
+            -- fallback_deg = offset de dirección (89=right, -89=left, 180=fwd).
+            -- Índices: 0=Disabled, 1=Spinbot, 2=Jitter, 3=Random, 4=Moonwalk
+            local function apply_dir_preset(p, fallback_deg)
+                local dir_base = base_y + fallback_deg  -- base apuntando a la dirección del bind
+                if p == 1 and ext then
+                    angle.y = dir_base + (tick * ext.spin_speed:GetValue()) % 360
+                elseif p == 2 and ext then
+                    local jt = ext.jitter_tick:GetValue()
+                    local jr = ext.jitter_range:GetValue()
+                    angle.y = dir_base + ((tick % jt >= jt / 2) and jr or -jr)
+                elseif p == 3 then
+                    angle.y = dir_base + math.random(-180, 180)
+                elseif p == 4 then
+                    -- Moonwalk: cara a la dirección del bind (right mira right, left mira left)
+                    angle.y = dir_base
+                else
+                    -- Disabled (0): dirección pura del bind
+                    angle.y = dir_base
+                end
+            end
+
+            -- FWD override: usa el preset asignado a Forward
+            if fwd_active_pm then
+                apply_dir_preset(0, 180)
+            -- Manual Left (bind izquierda): usa el preset configurado para "Left" en el grupo
+            elseif _aa_manual_state == 1 then
+                apply_dir_preset(aa_yaw_preset_left:GetValue(), -89)
+            -- Manual Right (bind derecha): usa el preset configurado para "Right" en el grupo
+            elseif _aa_manual_state == 2 then
+                apply_dir_preset(aa_yaw_preset_right:GetValue(), 89)
+            else
+                -- Estado neutro: si Yaw Type = Backwards, los presets parten de base_y_raw+180.
+                -- Se usa base_y_raw (sin el +180 de At Targets) para que Backwards siempre
+                -- apunte hacia atrás del jugador, independientemente de At Targets.
+                local nb = (ym == 1) and (base_y_raw + 180) or base_y
+                if preset == 1 and ext then
+                    angle.y = nb + (tick * ext.spin_speed:GetValue()) % 360
+                elseif preset == 2 and ext then
+                    local jt = ext.jitter_tick:GetValue()
+                    local jr = ext.jitter_range:GetValue()
+                    angle.y = nb + ((tick % jt >= jt / 2) and jr or -jr)
+                elseif preset == 3 then
+                    angle.y = nb + math.random(-180, 180)
+                elseif preset == 4 then
+                    -- Moonwalk: usar nb como base (ya tiene +180 si backwards)
+                    angle.y = nb
+                elseif ym == 1 then
+                    -- Disabled + Backwards: anclar ángulo opuesto al view del jugador
+                    angle.y = base_y_raw + 180
+                end
+            end
+
+            -- Pitch
+            if pm == 1 then      angle.x = 89
+            elseif pm == 2 then  angle.x = -89
+            elseif pm == 3 then  angle.x = 0
+            elseif pm == 4 then  angle.x = (tick % 4 < 2) and 89 or -89
+            end
+
+            -- Clamp SIEMPRE: ángulo fuera de rango causa crash nativo en CS2 (no lo atrapa pcall)
+            while angle.y >  180 do angle.y = angle.y - 360 end
+            while angle.y < -180 do angle.y = angle.y + 360 end
+            -- Anti-Invalid: clamp de pitch siempre activo
+            if angle.x >   89 then angle.x =  89 end
+            if angle.x <  -89 then angle.x = -89 end
+
+            cmd:SetViewAngles(angle)
+        end)
+
+        -- Semi-Rage AA: corre solo cuando lbot (legit) está activo
+        pcall(function()
+            if not cmd then return end
+            local sr = _G._fv2_sraa
+            if not sr or not (test4_en:GetValue() and test4_cat:GetValue() == 0) then return end
+            local lp2 = entities.GetLocalPawn()
+            if not lp2 or not lp2:IsAlive() then return end
+            -- Disable Conditions para AA Legit
+            local ldc = _G._fv2_legit_dc
+            if ldc then
+                local wt2 = -1
+                pcall(function() wt2 = lp2:GetWeaponType() end)
+                local is_gren2  = (wt2==9 or wt2==17 or wt2==15 or wt2==14 or wt2==16)
+                local is_knife2 = (wt2 == 0)
+                if ldc.ongren:GetValue()  and is_gren2  then return end
+                if ldc.onknife:GetValue() and is_knife2 then return end
+                if ldc.onkey:GetValue() then
+                    local kb2 = ldc.keybox:GetValue()
+                    if (tonumber(kb2) or 0) > 0 and input.IsButtonDown(kb2) then return end
+                end
+            end
+            local st = sr.state()
+            if st == 0 then return end
+            local ang2 = cmd:GetViewAngles()
+            if not ang2 then return end
+            local offset = sr.angle:GetValue()
+            if st == 1 then
+                ang2.y = ang2.y + offset
+            elseif st == 2 then
+                ang2.y = ang2.y - offset
+            end
+            -- Clamp siempre para evitar crash
+            while ang2.y >  180 do ang2.y = ang2.y - 360 end
+            while ang2.y < -180 do ang2.y = ang2.y + 360 end
+            cmd:SetViewAngles(ang2)
+        end)
+    end)
+
+    callbacks.Register("FireGameEvent","fv2_fge",function(ctx)
+        pcall(function()
+            if not ctx then return end; local ev=ctx:GetName(); if not ev then return end
+
+            if ev=="item_equip" then
+                local userid=ctx:GetInt("userid")
+                if fg_userid_to_idx(userid)==client.GetLocalPlayerIndex() then
+                    local item=ctx:GetString("item") or ""
+                    local _pistols  = {glock=1,hkp2000=1,usp_silencer=1,elite=1,p250=1,fiveseven=1,tec9=1,cz75a=1,deagle=1,revolver=1}
+                    local _grenades = {flashbang=1,hegrenade=1,smokegrenade=1,molotov=1,incgrenade=1,decoy=1,tagrenade=1}
+                    if not _grenades[item] and not item:find("knife") then
+                        _fg_prev_slot = _pistols[item] and 2 or 1
+                    end
+                end
+            end
+            if ev=="grenade_thrown" then
+                if not fg_master:GetValue() then return end
+                local userid=ctx:GetInt("userid")
+                if fg_userid_to_idx(userid)==client.GetLocalPlayerIndex() then
+                    _fg_pending_cmd    = "slot3;"
+                    _fg_switch_back_at = globals.RealTime() + 0.05
+                end
+            end
+            if ev=="weapon_fire" then
+                local userid=ctx:GetInt("userid"); local ent_idx=fg_userid_to_idx(userid)
+                if ent_idx and ent_idx==client.GetLocalPlayerIndex() then
+                    if qs_master:GetValue() then
+                        local wname = ctx:GetString("weapon") or ""
+                        if qs_weapon_active(wname) then
+                            local n = wname:gsub("weapon_", "")
+                            qs_return_slot    = (n == "deagle") and 2 or 1
+                            -- FIX #4: NO llamar client.Command aquí; se ejecuta en fv2_draw
+                            _qs_pending_slot3 = true
+                            qs_switch_back_at = globals.RealTime() + (qs_delay:GetValue() / 1000.0)
+                        end
+                    end
+                    -- Peek: volver al disparar
+                    if _pk_peeking and peek_ret_fire:GetValue() then
+                        _pk_returning = true
+                    end
+                end
+            end
+            -- Peek: volver si yo golpeo a alguien
+            if ev=="player_hurt" and _pk_peeking then
+                local attacker = fg_userid_to_idx(ctx:GetInt("attacker"))
+                if attacker and attacker == client.GetLocalPlayerIndex() then
+                    _pk_returning = true
+                end
+            end
+            -- Peek: reset completo al terminar la ronda o empezar una nueva.
+            -- Evita que el autopeek quede "atascado" entre rondas.
+            if ev=="round_end" or ev=="round_start" or ev=="cs_win_panel_match" then
+                _pk_reset()
+            end
+            -- Watermark FPS/Ping: resetear timers al entrar a partida → actualiza inmediatamente
+            if ev=="round_start" or ev=="player_spawned" then
+                _G._fv2_fps_last_time  = 0
+                _G._fv2_ping_last_time = 0
+            end
+        end)
+    end)
+
+        callbacks.Register("Draw","fv2_draw",function()
+        _ind_frame_slots  = {}   -- reset aquí: garantiza que siempre es {} antes de los indicators
+        _ind_skeet_pending = {}
+        pcall(function()
+            local lp=nil; pcall(function() lp=entities.GetLocalPawn() end)
+
+            -- FIX #6: ejecutar comandos diferidos de QS y FG aquí (Draw = contexto seguro)
+            if _qs_pending_slot3 then
+                client.Command("slot3;")
+                _qs_pending_slot3 = false
+            end
+            if _fg_pending_cmd then
+                client.Command(_fg_pending_cmd)
+                _fg_pending_cmd = nil
+            end
+            if _fg_switch_back_at ~= nil and globals.RealTime() >= _fg_switch_back_at then
+                client.Command("slot" .. _fg_prev_slot .. ";")
+                _fg_switch_back_at = nil
+            end
+            if qs_switch_back_at ~= nil and globals.RealTime() >= qs_switch_back_at then
+                client.Command((qs_return_slot == 2) and "slot2;" or "slot1;")
+                qs_switch_back_at = nil
+            end
+
+
+            if autostrafe_master:GetValue() then
+                local hc=autostrafe_hc:GetValue()
+                sv("misc.movement.autostrafe.hitchance",hc)
+                sv("misc.autostrafe.hitchance",hc)
+                sv("misc.movement.strafe.hitchance",hc)
+            else
+                if as_orig_hc~=nil then
+                    sv("misc.movement.autostrafe.hitchance",as_orig_hc)
+                    sv("misc.autostrafe.hitchance",as_orig_hc)
+                end
+            end
+
+            local js_on=js_master:GetValue()
+            sv("misc.jumpscout",js_on)
+            sv("misc.movement.jumpscout",js_on)
+
+
+            local _scope_on = scope_master:GetValue()
+            if _scope_on then
+                pcall(function()
+                    if lp and lp:IsAlive() then
+                        local pawn = lp
+                        local is_scoped = false
+                        pcall(function() is_scoped = pawn:GetFieldBool("m_bIsScoped") end)
+                        if is_scoped then
+                            local r1, g1, b1, a1 = scope_color_start:GetValue()
+                            local r2, g2, b2, a2 = scope_color_end:GetValue()
+                            local mode = scope_type:GetValue()
+                            local w, h = draw.GetScreenSize()
+                            local cx, cy = w / 2, h / 2
+                            local gap = scope_gap:GetValue()
+                            local thick = 1
+                            local length = scope_length:GetValue()
+                            drawGradientLine(cx - gap, cy, -1, 0, length, thick, r1, g1, b1, a1, r2, g2, b2, a2, mode)
+                            drawGradientLine(cx + gap, cy, 1, 0, length, thick, r1, g1, b1, a1, r2, g2, b2, a2, mode)
+                            drawGradientLine(cx, cy - gap, 0, -1, length, thick, r1, g1, b1, a1, r2, g2, b2, a2, mode)
+                            drawGradientLine(cx, cy + gap, 0, 1, length, thick, r1, g1, b1, a1, r2, g2, b2, a2, mode)
+                        end
+                    end
+                end)
+            end
+
+
+
+            local _in_game = false
+            pcall(function() _in_game = engine.IsInGame() == true end)
+            if not _in_game then
+                pcall(function()
+                    local lp = entities.GetLocalPawn()
+                    _in_game = lp ~= nil and lp:IsAlive() == true
+                end)
+            end
+
+            -- Ocultar HUD si: scoreboard (TAB), pausa (ESC), tienda, o consola abierta
+            local _hud_blocked = false
+            pcall(function() _hud_blocked = input.IsButtonDown(9) end)   -- TAB = scoreboard
+            if not _hud_blocked then
+                pcall(function() _hud_blocked = engine.IsPaused() == true end)  -- pausa
+            end
+            if _hud_blocked then return end
+
+            -- ── Watermark: solo en partida, no en menú ──
+            if _wm_active and _wm_text ~= "" and _in_game then
+                pcall(function()
+                    draw.SetFont(_wm_font)
+                    local sw, sh = draw.GetScreenSize()
+                    -- sep " | " para ambos estilos (afecta ancho del box)
+                    local sep = " | "
+                    -- Reconstruir partes desde _wm_text (almacenado con "|")
+                    local parts = {}
+                    for p in _wm_text:gmatch("[^|]+") do
+                        parts[#parts+1] = p:match("^%s*(.-)%s*$")
+                    end
+                    local display = table.concat(parts, sep)
+                    local w, h    = draw.GetTextSize(display)
+                    local pad_x   = 10
+                    local pad_y   = 6
+                    local start_y = sh * 0.0050
+                    local r_left  = _wm_pos == 1 and 0 or (sw - w - pad_x * 2 - 4)
+                    local r_right = r_left + w + pad_x * 2
+                    local r_bot   = start_y + h + pad_y * 2
+
+                    if _wm_style == 0 then
+                        -- ── Glass: fondo denso, borde fuerte, texto acento ──
+                        draw.Color(0, 0, 0, 140)
+                        draw.FilledRect(r_left, start_y, r_right, r_bot)
+                        draw.Color(_wm_accent[1], _wm_accent[2], _wm_accent[3], 100)
+                        draw.OutlinedRect(r_left, start_y, r_right, r_bot)
+                        local x = r_left + pad_x
+                        for i, part in ipairs(parts) do
+                            local pw = draw.GetTextSize(part)
+                            draw.Color(_wm_accent[1], _wm_accent[2], _wm_accent[3], _wm_accent[4])
+                            draw.Text(x, start_y + pad_y, part)
+                            x = x + pw
+                            if i < #parts then
+                                local sw2 = draw.GetTextSize(sep)
+                                draw.Color(_wm_accent[1], _wm_accent[2], _wm_accent[3],
+                                           math.floor(_wm_accent[4] * 0.35))
+                                draw.Text(x, start_y + pad_y, sep)
+                                x = x + sw2
+                            end
+                        end
+
+                    else
+                        -- ── Edge: fondo casi negro, borde top acento, texto blanco, sep acento ──
+                        draw.Color(0, 0, 0, 190)
+                        draw.FilledRect(r_left, start_y, r_right, r_bot)
+                        draw.Color(_wm_accent[1], _wm_accent[2], _wm_accent[3], _wm_accent[4])
+                        draw.FilledRect(r_left, start_y, r_right, start_y + 2)
+                        local x = r_left + pad_x
+                        for i, part in ipairs(parts) do
+                            local pw = draw.GetTextSize(part)
+                            draw.Color(255, 255, 255, 255)
+                            draw.Text(x, start_y + pad_y, part)
+                            x = x + pw
+                            if i < #parts then
+                                local sw2 = draw.GetTextSize(sep)
+                                draw.Color(_wm_accent[1], _wm_accent[2], _wm_accent[3],
+                                           math.floor(_wm_accent[4] * 0.60))
+                                draw.Text(x, start_y + pad_y, sep)
+                                x = x + sw2
+                            end
+                        end
+                    end
+                end)
+            end
+
+            if ind_master:GetValue() and _in_game then
+                -- Clean Scope: ocultar indicadores mientras el jugador está escopado
+                if ind_clean_scope:GetValue() then
+                    local scoped = false
+                    pcall(function()
+                        if lp and lp:IsAlive() then
+                            scoped = lp:GetFieldBool("m_bIsScoped") == true
+                        end
+                    end)
+                    if scoped then return end
+                end
+                -- actualizar offsets desde GUI (independientes por panel)
+                if ind_off_en.side:GetValue() then
+                    if ind_off_reset_s:GetValue() then
+                        ind_off_x_side :SetValue(0)
+                        ind_off_y_side :SetValue(0)
+                        ind_off_reset_s:SetValue(false)
+                        for _, entry in ipairs(_flat_order) do
+                            pcall(function()
+                                if entry.k ~= "dmgnum" and entry.k ~= "nospread" then
+                                    if ind_side_col[entry.k] then
+                                        ind_side_col[entry.k]:SetValue(132, 196, 20, 245)
+                                    end
+                                end
+                            end)
+                        end
+                    end
+                    _ind_off_x_val = ind_off_x_side:GetValue()
+                    _ind_off_y_val = ind_off_y_side:GetValue()
+                else
+                    _ind_off_x_val = 0
+                    _ind_off_y_val = 0
+                end
+                if ind_off_en.xhair:GetValue() then
+                    if ind_off_reset_x:GetValue() then
+                        ind_off_y_xhair:SetValue(0)
+                        ind_xhair_gap  :SetValue(12)
+                        ind_off_reset_x:SetValue(false)
+                        for _, entry in ipairs(_flat_order) do
+                            pcall(function()
+                                if ind_xhair_col[entry.k] then
+                                    ind_xhair_col[entry.k]:SetValue(255, 255, 255, 245)
+                                end
+                            end)
+                        end
+                    end
+                    _ind_off_y_xhair_val = ind_off_y_xhair:GetValue()
+                else
+                    _ind_off_y_xhair_val = 0
+                end
+
+                -- Colores de cada panel
+                local sr, sg, sb, sa = ind_color_side :GetValue()
+                local xr, xg, xb, xa = ind_color_xhair:GetValue()
+
+                -- ── Helper: dibuja todos los indicadores para un panel ─────────────
+                -- sel=0 → Side (renderer_indicator dibuja a la izquierda)
+                -- sel=1 → Crosshair (renderer_indicator acumula en _ind_skeet_pending)
+                local function _draw_panel(sel, ind_tab, r, g, b, a, ind_cols)
+                    _xhair_sel       = sel
+                    _ind_frame_slots = {}
+                    if sel == 0 then _ind_skeet_pending = {} end
+                    -- Helper: devuelve color por indicador si split activo, sino el global
+                    local function _c(key)
+                        -- Damage y Nospread siempre en blanco, independiente del split
+                        if key == "dmgnum" or key == "nospread" then
+                            if ind_cols and ind_cols[key] then
+                                return ind_cols[key]:GetValue()
+                            end
+                            return 255, 255, 255, 245
+                        end
+                        if (ind_split_s:GetValue() or ind_split_x:GetValue()) and ind_cols and ind_cols[key] then
+                            return ind_cols[key]:GetValue()
+                        end
+                        return r, g, b, a
+                    end
+
+                    -- Orden: primero llamado = abajo, último = arriba en pantalla
+                    if ind_tab.awrage:GetValue() and rb_autowall_enable:GetValue() then
+                        local cr,cg,cb_,ca = _c("awrage")
+                        renderer_indicator(cr, cg, cb_, ca, sel == 0 and "AW" or "AUTOWALL")
+                    end
+                    if ind_tab.rage:GetValue() and rb_rage_enable:GetValue() then
+                        local cr,cg,cb_,ca = _c("rage")
+                        renderer_indicator(cr, cg, cb_, ca, "RAGE")
+                    end
+                    if ind_tab.fov:GetValue() then
+                        local fov_txt = "FOV -"
+                        pcall(function()
+                            local v = gui.GetValue("rbot.fov")
+                            if v then
+                                fov_txt = sel == 0 and ("FOV: "..math.floor(v+0.5)) or ("FOV "..math.floor(v+0.5))
+                            end
+                        end)
+                        local cr,cg,cb_,ca = _c("fov")
+                        renderer_indicator(cr, cg, cb_, ca, fov_txt)
+                    end
+                    if ind_tab.dt:GetValue() and rb_doubletap:GetValue() then
+                        local cr,cg,cb_,ca = _c("dt")
+                        renderer_indicator(cr, cg, cb_, ca, "DT")
+                    end
+                    if ind_tab.dmgnum:GetValue() then
+                        local dmg_val = nil
+                        if ind_dmg_update:GetValue() then
+                            pcall(function()
+                                local idx = rb_wep_combo and (rb_wep_combo:GetValue() + 1) or 1
+                                if rb_override_en[idx] and rb_override_en[idx]:GetValue() then
+                                    dmg_val = rb_override_val[idx]:GetValue()
+                                else
+                                    if rb_mdmg and rb_mdmg[idx] then dmg_val = rb_mdmg[idx]:GetValue() end
+                                end
+                            end)
+                        else
+                            pcall(function()
+                                local w = gui.GetValue("rbot.hitscan.accuracy")
+                                if w then
+                                    dmg_val = gui.GetValue("rbot.hitscan.accuracy."..w:gsub('"',''):lower()..".mindamage")
+                                end
+                            end)
+                            if not dmg_val or type(dmg_val) ~= "number" then
+                                local idx = rb_wep_combo and (rb_wep_combo:GetValue() + 1) or 1
+                                if rb_mdmg and rb_mdmg[idx] then dmg_val = rb_mdmg[idx]:GetValue() end
+                            end
+                        end
+                        local cr,cg,cb_,ca = _c("dmgnum") ; renderer_indicator(cr, cg, cb_, ca, dmg_val and tostring(math.floor(dmg_val)) or "?")
+                    end
+                    if ind_tab.nospread:GetValue() and rb_nospread:GetValue() then
+                        local cr,cg,cb_,ca = _c("nospread") ; renderer_indicator(cr, cg, cb_, ca, "NS")
+                    end
+                    if ind_tab.ovr:GetValue() then
+                        local idx = rb_wep_combo and (rb_wep_combo:GetValue() + 1) or 1
+                        if rb_override_en[idx] and rb_override_en[idx]:GetValue() then
+                            local cr,cg,cb_,ca = _c("ovr") ; renderer_indicator(cr, cg, cb_, ca, "DMG")
+                        end
+                    end
+                    if ind_tab.baimrage:GetValue() and rb_forcebody:GetValue() then
+                        local cr,cg,cb_,ca = _c("baimrage") ; renderer_indicator(cr, cg, cb_, ca, "BAIM")
+                    end
+                    if ind_tab.qswitch:GetValue() and qs_master:GetValue() then
+                        local cr,cg,cb_,ca = _c("qswitch") ; renderer_indicator(cr, cg, cb_, ca, "QS")
+                    end
+                    if ind_tab.baim:GetValue() then
+                        pcall(function()
+                            if kb_forcebody:GetValue() then
+                                local cr,cg,cb_,ca = _c("baim") ; renderer_indicator(cr, cg, cb_, ca, "BAIM")
+                            end
+                        end)
+                    end
+                    if ind_tab.aw:GetValue() and kb_autowall:GetValue() then
+                        local cr,cg,cb_,ca = _c("aw") ; renderer_indicator(cr, cg, cb_, ca, sel == 0 and "AW" or "AUTOWALL")
+                    end
+                    if ind_tab.trg:GetValue() then
+                        pcall(function()
+                            if kb_trigger:GetValue() then
+                                local cr,cg,cb_,ca = _c("trg") ; renderer_indicator(cr, cg, cb_, ca, "TM")
+                            end
+                        end)
+                    end
+                    if ind_tab.trigger:GetValue() then
+                        pcall(function()
+                            if kb_autofire:GetValue() then
+                                local cr,cg,cb_,ca = _c("trigger") ; renderer_indicator(cr, cg, cb_, ca, sel == 1 and "AUTOFIRE" or "AF")
+                            end
+                        end)
+                    end
+                    if ind_tab.fs:GetValue() and _fv2_fs_active then
+                        local cr,cg,cb_,ca = _c("fs") ; renderer_indicator(cr, cg, cb_, ca, "FS")
+                    end
+
+                    -- Flush Crosshair: centrado en el crosshair (estilo isabel)
+                    if sel == 1 and #_ind_skeet_pending > 0 then
+                        local sz_sk  = _xhair_size_val
+                        local fnt_sk = _get_xhair_font(sz_sk)
+                        if fnt_sk then draw.SetFont(fnt_sk) end
+                        local sw_sk, sh_sk = draw.GetScreenSize()
+                        local cx_sk  = math.floor(sw_sk / 2)
+                        local base_y = math.floor(sh_sk / 2) + _ind_off_y_xhair_val
+                        local LINE_H = 14
+                        for i, entry in ipairs(_ind_skeet_pending) do
+                            local tw_sk = draw.GetTextSize(entry.text)
+                            local tx_sk = cx_sk - math.floor(tw_sk / 2)
+                            local ty_sk = base_y + LINE_H * i
+                            draw.Color(entry.r, entry.g, entry.b, entry.a)
+                            local _ts_ok = pcall(function()
+                                draw.TextShadow(tx_sk, ty_sk, entry.text)
+                            end)
+                            if not _ts_ok then
+                                draw.Color(0, 0, 0, 200)
+                                draw.Text(tx_sk + 1, ty_sk + 1, entry.text)
+                                draw.Color(entry.r, entry.g, entry.b, entry.a)
+                                draw.Text(tx_sk, ty_sk, entry.text)
+                            end
+                        end
+                    end
+                end
+                -- ── Pasada 1: Side ───────────────────────────────────────────────
+                -- Cuando split ON, usar las cb_s del sep_win (visibles al usuario).
+                -- Cuando split OFF, usar los multibox del menú principal.
+                local split_active_s = ind_split_s:GetValue()
+                local split_active_x = ind_split_x:GetValue()
+                _draw_panel(0, split_active_s and ind_sep_side  or ind_side,
+                               sr, sg, sb, sa, ind_side_col)
+                -- ── Pasada 2: Crosshair ──────────────────────────────────────────
+                _draw_panel(1, split_active_x and ind_sep_xhair or ind_xhair_tab,
+                               xr, xg, xb, xa, ind_xhair_col)
+                -- Restaurar _xhair_sel al valor del combobox (para otros usos del frame)
+                _xhair_sel = ind_font_sel:GetValue()
+
+            end
+        end)
+    end)
+
+    -- ── Peek: dibujar círculo en start_pos (con estilos) ─────────────
+    callbacks.Register("Draw","fv2_pk_draw",function()
+        if not _pk_peeking or not _pk_start_pos then return end
+        pcall(function()
+            local sel = peek_style and peek_style:GetValue() or 0
+            local t   = globals.RealTime()
+            local r, g, b, a
+
+            -- Color 1 = cuando registra/retorna; Color 2 = principal mientras peekea
+            if _pk_returning then
+                r, g, b, a = peek_circ_col:GetValue()
+            else
+                r, g, b, a = peek_ret_col:GetValue()
+            end
+
+            local px, py, pz = _pk_start_pos.x, _pk_start_pos.y, _pk_start_pos.z
+
+            -- ── Helpers world-space ───────────────────────────────────
+            local function wpt(ang, rad)
+                return client.WorldToScreen(Vector3(
+                    px + math.cos(ang) * rad,
+                    py + math.sin(ang) * rad,
+                    pz))
+            end
+            local function wring(rad, segs, skip, am)
+                draw.Color(r, g, b, math.floor((a or 255) * (am or 1.0)))
+                local step = (math.pi * 2) / segs
+                local ppx, ppy = nil, nil
+                for i = 0, segs do
+                    if not skip or (i % 2 == 0) then
+                        local sx2, sy2 = wpt(i * step, rad)
+                        if sx2 and sy2 then
+                            if ppx then draw.Line(ppx, ppy, sx2, sy2) end
+                            ppx, ppy = sx2, sy2
+                        else ppx, ppy = nil, nil end
+                    else ppx, ppy = nil, nil end
+                end
+            end
+
+            -- ── 0 Basic ───────────────────────────────────────────────
+            if sel == 1 then
+            do
+                wring(15, 48, false, 1.0)
+            end
+            -- ── 1 Void ───────────────────────────────────────────────
+            elseif sel == 0 then
+            do
+                wring(15, 48, false, 1.0)
+                local p = math.sin(t*5)*2
+                wring(15+p, 32, false, 0.45)
+                wring(15-p, 32, false, 0.2)
+            end
+            -- ── 2 Radial ─────────────────────────────────────────────
+            elseif sel == 2 then
+            do
+                -- anillos Prism rotando a distintas velocidades (fondo)
+                local rings = {
+                    {rad=10, spd= 2.1, segs=32},
+                    {rad=15, spd=-1.4, segs=40},
+                    {rad=20, spd= 0.8, segs=32},
+                }
+                for idx, rd in ipairs(rings) do
+                    local rot2 = t * rd.spd
+                    local ppxr, ppyr = nil, nil
+                    for i = 0, rd.segs do
+                        local frac = i/rd.segs
+                        local ang  = rot2 + frac*math.pi*2
+                        local alp  = 0.15 + 0.12*math.sin(frac*math.pi*2 + t*idx*0.4)
+                        local sx2,sy2 = wpt(ang, rd.rad)
+                        if sx2 and sy2 then
+                            draw.Color(r,g,b, math.floor(a*alp))
+                            if ppxr then draw.Line(ppxr,ppyr,sx2,sy2) end
+                            ppxr,ppyr = sx2,sy2
+                        else ppxr,ppyr = nil,nil end
+                    end
+                end
+                -- dots radiales pulsantes (frente)
+                local n   = 6
+                local rot = t * 1.2
+                for i = 0, n-1 do
+                    local ang   = rot + (math.pi*2/n)*i
+                    local pulse = 0.5 + 0.5*math.sin(t*2.5 + i*(math.pi*2/n))
+                    local rad   = 12 + pulse*6
+                    local trail = 12
+                    for tr = 0, trail do
+                        local frac = 1 - tr/trail
+                        local glow = frac * frac
+                        local a_tr = ang - tr*(math.pi/(n*trail))
+                        local r_tr = math.max(8, rad - tr*0.4)
+                        local ox,oy = wpt(a_tr, r_tr)
+                        if ox and oy then
+                            local sz = math.max(1, math.floor(frac*3.5))
+                            draw.Color(r,g,b, math.floor(a*glow*0.35))
+                            draw.FilledRect(ox-(sz+2), oy-(sz+2), ox+(sz+2), oy+(sz+2))
+                            draw.Color(r,g,b, math.floor(a*glow))
+                            draw.FilledRect(ox-sz, oy-sz, ox+sz, oy+sz)
+                        end
+                    end
+                end
+            end
+            -- ── 3 Orbit ─────────────────────────────────────────────
+            elseif sel == 3 then
+            do
+                wring(15, 48, false, 0.35)
+                local layers = {
+                    {spd=2.5, rad=15, n=3, trail=12, sz=3, alp=1.0 },
+                    {spd=4.2, rad=22, n=2, trail=10, sz=2, alp=0.85},
+                    {spd=1.6, rad=28, n=4, trail= 8, sz=2, alp=0.7 },
+                    {spd=3.1, rad=19, n=5, trail= 6, sz=1, alp=0.5 },
+                }
+                for _, lyr in ipairs(layers) do
+                    for dot = 0, lyr.n-1 do
+                        local base = t*lyr.spd + (math.pi*2/lyr.n)*dot
+                        for tr = 0, lyr.trail do
+                            local frac = 1 - tr/lyr.trail
+                            local glow = frac * frac
+                            local ox, oy = wpt(base - tr*0.06, lyr.rad)
+                            if ox and oy then
+                                draw.Color(r,g,b, math.floor(a*lyr.alp*glow*0.35))
+                                draw.FilledRect(ox-(lyr.sz+2), oy-(lyr.sz+2), ox+(lyr.sz+2), oy+(lyr.sz+2))
+                                draw.Color(r,g,b, math.floor(a*lyr.alp*glow))
+                                draw.FilledRect(ox-lyr.sz, oy-lyr.sz, ox+lyr.sz, oy+lyr.sz)
+                            end
+                        end
+                    end
+                end
+            end
+            -- ── 4 Pulse ──────────────────────────────────────────────
+            elseif sel == 4 then
+            do
+                wring(15, 48, false, 0.15)
+                local layers = {
+                    {spd=3.0, rad=15, n=5, alp=1.0 },
+                    {spd=1.8, rad=21, n=3, alp=0.7 },
+                }
+                for _, lyr in ipairs(layers) do
+                    for dot = 0, lyr.n-1 do
+                        local base  = t*lyr.spd + (math.pi*2/lyr.n)*dot
+                        local pulse = 0.5 + 0.5*math.sin(t*3 + dot*1.2)
+                        local sz    = math.max(1, math.floor(pulse*4))
+                        local ox, oy = wpt(base, lyr.rad)
+                        if ox and oy then
+                            draw.Color(r,g,b, math.floor(a*lyr.alp*pulse*0.3))
+                            draw.FilledRect(ox-(sz+3), oy-(sz+3), ox+(sz+3), oy+(sz+3))
+                            draw.Color(r,g,b, math.floor(a*lyr.alp))
+                            draw.FilledRect(ox-sz, oy-sz, ox+sz, oy+sz)
+                        end
+                    end
+                end
+            end
+            -- ── 5 Wave ───────────────────────────────────────────────
+            elseif sel == 5 then
+            do
+                wring(15, 48, false, 0.2)
+                local n_dots = 4
+                local spd    = 2.2
+                local step   = math.pi*2 / 48
+                for dot = 0, n_dots-1 do
+                    local base = t*spd + (math.pi*2/n_dots)*dot
+                    local trail = 20
+                    for tr = 0, trail do
+                        local frac = 1 - tr/trail
+                        local glow = frac * frac
+                        local ang  = base - tr*step
+                        local ox,oy = wpt(ang, 15)
+                        if ox and oy then
+                            local sz = math.max(1, math.floor(frac*3))
+                            draw.Color(r,g,b, math.floor(a*glow*0.3))
+                            draw.FilledRect(ox-(sz+2), oy-(sz+2), ox+(sz+2), oy+(sz+2))
+                            draw.Color(r,g,b, math.floor(a*glow))
+                            draw.FilledRect(ox-sz, oy-sz, ox+sz, oy+sz)
+                        end
+                    end
+                end
+            end
+            -- ── 6 Solar ──────────────────────────────────────────────
+            elseif sel == 6 then
+            do
+                wring(15, 48, false, 0.2)
+                local comets = {
+                    {rad=15, spd=3.0, trail=20, sz=3},
+                    {rad=22, spd=2.0, trail=16, sz=2},
+                    {rad=28, spd=1.3, trail=12, sz=2},
+                }
+                for _, c in ipairs(comets) do
+                    local base = t * c.spd
+                    for tr = 0, c.trail do
+                        local frac = 1 - tr/c.trail
+                        local glow = frac * frac * frac
+                        local ang  = base - tr * 0.07
+                        local ox,oy = wpt(ang, c.rad)
+                        if ox and oy then
+                            local sz = (tr == 0) and c.sz or math.max(1, math.floor(frac*c.sz))
+                            if tr == 0 then
+                                draw.Color(r,g,b, math.floor(a*0.4))
+                                draw.FilledRect(ox-(sz+3), oy-(sz+3), ox+(sz+3), oy+(sz+3))
+                            end
+                            draw.Color(r,g,b, math.floor(a*glow))
+                            draw.FilledRect(ox-sz, oy-sz, ox+sz, oy+sz)
+                        end
+                    end
+                end
+            end
+            -- ── 7 Prism ──────────────────────────────────────────────
+            elseif sel == 7 then
+            do
+                local rings_d = {
+                    {rad= 9, spd=2.8, segs=32},
+                    {rad=13, spd=1.8, segs=40},
+                    {rad=17, spd=0.9, segs=48},
+                    {rad=21, spd=1.5, segs=40},
+                    {rad=25, spd=2.2, segs=32},
+                }
+                for idx, rd in ipairs(rings_d) do
+                    local rot = t * rd.spd
+                    local ppx13, ppy13 = nil, nil
+                    for i = 0, rd.segs do
+                        local frac = i/rd.segs
+                        local ang  = rot + frac*math.pi*2
+                        local alp  = 0.25 + 0.4*math.sin(frac*math.pi*2 + t*idx*0.3)
+                        local sx2,sy2 = wpt(ang, rd.rad)
+                        if sx2 and sy2 then
+                            draw.Color(r,g,b, math.floor(a*alp))
+                            if ppx13 then draw.Line(ppx13,ppy13,sx2,sy2) end
+                            ppx13,ppy13 = sx2,sy2
+                        else ppx13,ppy13 = nil,nil end
+                    end
+                end
+            end
+            end
+        end)
+    end)
+    -- ─────────────────────────────────────────────────────────────────
+
+    -- OPT: dirty-checks para menu_open y posición de ventanas
+    local _ts_last_menu  = nil
+    local _ts_last_wx    = nil
+    local _ts_last_wy    = nil
+    local _ts_pos_frame  = 0
+    callbacks.Register("Draw","fv2_tabswitch",function()
+        local menu_open=false
+        pcall(function() local m=gui.Reference("Menu"); if m then menu_open=m:IsActive() end end)
+        if menu_open ~= _ts_last_menu then
+            _ts_last_menu = menu_open
+            pcall(function() win:SetActive(menu_open) end)
+        end
+        local t=tab_sel:GetValue()
+        if t~=_last_tab then refresh_tabs();_last_tab=t end
+
+        -- Side Colors / Crosshair Colors: solo mover si la ventana cambió de pos
+        -- OPT: throttle a cada 5 frames (ventana no se mueve a 300fps)
+        _ts_pos_frame = _ts_pos_frame + 1
+        if _ts_pos_frame < 5 then return end
+        _ts_pos_frame = 0
+        pcall(function()
+            local wx, wy = win:GetValue()
+            if wx == _ts_last_wx and wy == _ts_last_wy then return end
+            _ts_last_wx = wx; _ts_last_wy = wy
+            local sep_x = wx + WIN_W + 5
+            sep_win_s:SetPosX(sep_x)
+            sep_win_s:SetPosY(wy)
+            sep_win_x:SetPosX(sep_x)
+            sep_win_x:SetPosY(wy)
+        end)
+    end)
+    refresh_tabs()
+
+    callbacks.Register("Unload","fv2_unload",function()
+        pcall(function() win:SetActive(false) end)
+        pcall(function()
+            client.SetConVar("viewmodel_fov", vm_orig_fov)
+            pcall(function() gui.SetValue("world.viewmodelfov", vm_orig_fov) end)
+        end)
+        pcall(function() client.SetConVar("r_drawviewmodel", "1", true) end)
+        if as_orig_hc~=nil then
+            sv("misc.movement.autostrafe.hitchance",as_orig_hc)
+            sv("misc.autostrafe.hitchance",as_orig_hc)
+        end
+        -- Restaurar Force Body hitbox al descargar
+        if _rb_fb_orig ~= nil and _rb_fb_orig_grp ~= nil then
+            local base = "rbot.hitbox." .. _rb_fb_orig_grp .. "."
+            local o = _rb_fb_orig
+            pcall(function() gui.SetValue(base.."head.priority",  o.hp) end)
+            pcall(function() gui.SetValue(base.."head.exposed",   o.he) end)
+            pcall(function() gui.SetValue(base.."head.center",    o.hc) end)
+            pcall(function() gui.SetValue(base.."body.priority",  o.bp) end)
+            pcall(function() gui.SetValue(base.."body.lethal",    o.bl) end)
+            pcall(function() gui.SetValue(base.."body.exposed",   o.be) end)
+            pcall(function() gui.SetValue(base.."body.center",    o.bc) end)
+            pcall(function() gui.SetValue(base.."limbs.exposed",  o.le) end)
+            pcall(function() gui.SetValue(base.."limbs.center",   o.lc) end)
+        end
+        -- Restaurar autowall al descargar
+        for _,grp in ipairs(kb_wep_groups) do
+            sv("lbot.weapon.vis."..grp..".autowall",false)
+        end
+        -- Restaurar body aim al descargar
+        for _, grp in ipairs(kb_wep_groups) do
+            pcall(function()
+                local orig = kb_forcebody_orig[grp]
+                if not orig then return end
+                if orig.aim ~= nil then gui.SetValue("lbot.aim.hitbox."..grp..".hitbox", orig.aim) end
+                if orig.trg ~= nil then gui.SetValue("lbot.trg.hitbox."..grp..".hitbox", orig.trg) end
+            end)
+        end
+        for _, cb_name in ipairs(_bm_cb_names) do
+            pcall(function() callbacks.Unregister("Draw", cb_name) end)
+        end
+        pcall(function() callbacks.Unregister("CreateMove","fv2_createmove") end)
+        pcall(function() callbacks.Unregister("CreateMove","fv2_kb_cm")      end)
+        pcall(function() callbacks.Unregister("PreMove",   "fv2_aa_premove") end)  -- FIX #8
+        pcall(function() gui.SetValue("rbot.antiaim.enabled", false) end)
+        pcall(function() gui.SetValue("rbot.antiaim.autodir.edges", false) end)
+        pcall(function() callbacks.Unregister("FireGameEvent","fv2_fge")     end)
+        pcall(function() callbacks.Unregister("Draw","fv2_draw")             end)
+        pcall(function() callbacks.Unregister("Draw","fv2_ind_reset")        end)
+        pcall(function() callbacks.Unregister("Draw","fv2_tabswitch")        end)
+        pcall(function() callbacks.Unregister("Draw","fv2_kb_draw")          end)
+        pcall(function() callbacks.Unregister("Draw","fv2_rb_draw")          end)
+        pcall(function() callbacks.Unregister("Draw","fv2_rb_wepsel")        end)
+        pcall(function() callbacks.Unregister("Draw","fv2_kb_wepsel")        end)
+        pcall(function() callbacks.Unregister("Draw","fv2_aa_draw")          end)
+        pcall(function() callbacks.Unregister("Draw","fv2_aa_ext_vis")       end)
+        _G._fv2_aa_ext = nil
+        _G._fv2_aa_dc  = nil
+        pcall(function() callbacks.Unregister("Draw","fv2_wm_cache")         end)
+        pcall(function() callbacks.Unregister("Draw","fv2_st_wepsel")        end)
+        pcall(function() callbacks.Unregister("Draw","fv2_pk_draw")          end)
+        pcall(function() callbacks.Unregister("AimbotTarget","fv2_pk_tgt")   end)
+        pcall(function() callbacks.Unregister("Draw","fv2_font_update")       end)
+        pcall(function() callbacks.Unregister("Draw","fv2_ctanim_draw")        end)
+        _G._fv2_sraa     = nil
+        _G._fv2_aa_no_cb  = nil
+        _G._fv2_aa_no_sel = nil
+        pcall(function() callbacks.Unregister("Draw", "fv2_aa_no_upd") end)
+        pcall(function() sep_win_s:SetInvisible(true) end)
+        pcall(function() sep_win_x:SetInvisible(true) end)
+        -- Restaurar nombre al descargar
+        pcall(function()
+            if _G.__ct_original_name and _G.__ct_original_name ~= "" then
+                if _G.__ct_ffi_ok and _G.__ct_ffi_cvar then
+                    _G.__ct_ffi_cvar.nFlags = 33408
+                end
+                client.Command('setinfo name "' .. _G.__ct_original_name .. '"', true)
+            end
+            _G.__ct_ffi_ok       = nil
+            _G.__ct_ffi_cvar     = nil
+            _G.__ct_original_name = nil
+        end)
+        _G.__fantasy_v2_loaded = nil
+    end)
+
+    client.Command("echo ·:·:·:·:·:·:·:·:⛧⛧⛧·:·:·:·:·:·:·:·:·", true)
+    client.Command("echo ············⛧ fantasy.fix ⛧············", true)
+    client.Command("echo ⛧··⛧·····⛧ suggestions ⋆.˚ ds:seedww ⛧··⛧····⛧", true)
+    client.Command("echo ·:·:·:·:·:·:·:·:⛧⛧⛧·:·:·:·:·:·:·:·:·:", true)
+end)
+
+client.AllowListener("item_equip")
+client.AllowListener("grenade_thrown")
+client.AllowListener("player_hurt")
+client.AllowListener("weapon_fire")
+client.AllowListener("player_spawned")
+
+_G.__fantasy_v2_loaded = true
